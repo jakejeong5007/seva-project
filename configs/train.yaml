@@ -1,0 +1,49 @@
+experiment:
+  name: seva_dl3dv_1k_256x448
+  output_dir: outputs/seva_dl3dv_1k_256x448
+
+train:
+  mode: finetune          # scratch | finetune | resume
+  seed: 42
+
+  pretrained_ckpt: /path/to/pretrained.ckpt
+  resume_ckpt: null
+
+  epochs: 10
+  max_steps: null
+
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  betas: [0.9, 0.999]
+  grad_clip_norm: 1.0
+  grad_accum_steps: 1
+  mixed_precision: true
+
+  log_every: 20
+  val_every: 500
+  save_every: 1000
+  sample_every: 1000
+
+  overfit_one_batch: false
+
+scheduler:
+  type: cosine
+  warmup_steps: 500
+  min_lr: 1.0e-6
+
+loss:
+  type: mse
+  weight_denoise: 1.0
+
+model:
+  name: seva
+  use_ema: false
+
+sampling:
+  num_steps: 50
+  guidance_scale: 1.0
+
+system:
+  device: cuda
+  cudnn_benchmark: true
+  

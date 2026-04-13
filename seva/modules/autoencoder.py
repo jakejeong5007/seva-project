@@ -10,7 +10,7 @@ class AutoEncoder(nn.Module):
     def __init__(self, chunk_size: int | None = None):
         super().__init__()
         self.module = AutoencoderKL.from_pretrained(
-            "stabilityai/stable-diffusion-2-1-base",
+            "sd2-community/stable-diffusion-2-1-base",
             subfolder="vae",
             force_download=False,
             low_cpu_mem_usage=False,
