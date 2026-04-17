@@ -1,0 +1,60 @@
+experiment:
+  run_name: seva_smoke
+  output_dir: runs
+
+train:
+  init_backbone_mode: scratch   # scratch | resume | official | local_pretrained
+  seed: 42
+  epochs: 1
+  max_steps: 1000
+  resume: null
+  lr: null
+  weight_decay: 1.0e-2
+  betas: "0.9,0.999"
+  eps: 1.0e-8
+  grad_clip_norm: 1.0
+  grad_accum_steps: 1
+  log_every: 10
+  val_every: 100
+  save_every: 100
+  val_batches: 4
+
+dataset:
+  total_frames: 8
+  num_input_views: "1"
+  height: 576
+  width: 576
+  normalize_intrinsics: true
+  batch_size: 1
+  num_workers: 0
+
+model:
+  train_backbone: true
+  train_conditioner: false
+  train_ae: false
+  use_dummy_ae: false
+  ae_kwargs_json: "{}"
+  official_model_version: 1.1
+  official_pretrained_model_name_or_path: stabilityai/stable-virtual-camera
+  official_weight_name: model.safetensors
+  pretrained_ckpt: null
+  pretrained_strict: false
+
+diffusion:
+  schedule: cosine_vp
+  objective: epsilon
+  latent_channels: 4
+  latent_downsample_factor: 8
+  latent_scaling_factor: 1.0
+  encoding_t: 1
+  sample_posterior: false
+  camera_scale: 2.0
+  target_frame_weight: 1.0
+  input_frame_weight: 0.0
+  cfg_dropout_prob: 0.0
+
+system:
+  device: cuda
+  dtype: bfloat16
+  autocast_dtype: bfloat16
+  sdpa_backend: math

@@ -29,8 +29,14 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["ruff", "ipdb", "pytest", "line_profiler", "pre-commit"]
 
+[project.scripts]
+seva-train = "train.train:main"
+
 [tool.setuptools.packages.find]
-include = ["seva"]
+include = ["seva", "seva.*", "train", "train.*"]
+
+[tool.setuptools.package-data]
+train = ["configs/*.yaml"]
 
 [tool.pyright]
 extraPaths = ["third_party/dust3r"]

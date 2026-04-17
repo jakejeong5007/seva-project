@@ -48,3 +48,5 @@ htmlcov/
 .pre-commit-config.yaml~
 
 dataset/
+assets_demo_cli/
+runs/

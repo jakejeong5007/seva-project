@@ -1,0 +1,629 @@
+# File: diffusion_loss.py
+# Description: Starter diffusion training loss for SEVA built to match the
+#              current clip_dataset.py, conditioning.py, and model_factory.py.
+
+from __future__ import annotations
+
+from contextlib import nullcontext
+from dataclasses import dataclass
+from typing import Any, Dict, Literal, Optional
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+try:
+    from train.training.conditioning import (
+        ConditioningOutput,
+        build_seva_conditioning,
+        flatten_conditioning_for_model,
+    )
+    from train.training.model_factory import SevaBundle
+except ImportError:
+    # Fallback for direct local execution outside the package layout.
+    from conditioning import (  # type: ignore
+        ConditioningOutput,
+        build_seva_conditioning,
+        flatten_conditioning_for_model,
+    )
+    from model_factory import SevaBundle  # type: ignore
+
+
+ScheduleName = Literal["cosine_vp", "rf_linear"]
+ObjectiveName = Literal["epsilon", "x0", "v", "velocity"]
+
+
+@dataclass
+class DiffusionLossOutput:
+    """Container for one SEVA training-loss forward pass.
+
+    Attributes:
+        loss:
+            Scalar training loss after masking/weighting.
+        mse_per_item:
+            Per-frame MSE reduced over latent channels and spatial dims.
+            Shape [B, T].
+        weights:
+            Per-frame loss weights used for the final weighted average.
+            Shape [B, T].
+        pred:
+            Model prediction in flattened form [B*T, C, h, w].
+        target:
+            Training target in flattened form [B*T, C, h, w].
+        latents:
+            Clean latents [B, T, C, h, w].
+        noisy_latents:
+            Noisy latents [B, T, C, h, w].
+        noise:
+            Sampled Gaussian noise [B, T, C, h, w].
+        timesteps:
+            Continuous timesteps [B, T].
+        alpha:
+            Clean-signal coefficient [B, T].
+        sigma:
+            Noise coefficient [B, T].
+        conditioning:
+            ConditioningOutput from conditioning.py.
+        flat_conditioning:
+            Flattened model conditioning dict [B*T, ...].
+    """
+
+    loss: torch.Tensor
+    mse_per_item: torch.Tensor
+    weights: torch.Tensor
+    pred: torch.Tensor
+    target: torch.Tensor
+    latents: torch.Tensor
+    noisy_latents: torch.Tensor
+    noise: torch.Tensor
+    timesteps: torch.Tensor
+    alpha: torch.Tensor
+    sigma: torch.Tensor
+    conditioning: ConditioningOutput
+    flat_conditioning: Dict[str, torch.Tensor]
+
+
+def _require_tensor(batch: Dict[str, Any], key: str) -> torch.Tensor:
+    if key not in batch:
+        raise KeyError(f"Batch is missing required key: {key!r}")
+    value = batch[key]
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"Batch[{key!r}] must be a torch.Tensor, got {type(value)}")
+    return value
+
+
+def _ensure_batched_clip_batch(batch: Dict[str, Any]) -> Dict[str, Any]:
+    """Accept either a single clip sample or a collated batch.
+
+    Single clip sample:
+        imgs: [T, 3, H, W]
+
+    Collated batch:
+        imgs: [B, T, 3, H, W]
+    """
+    imgs = _require_tensor(batch, "imgs")
+    if imgs.dim() == 5:
+        return batch
+    if imgs.dim() != 4:
+        raise ValueError(
+            f"Expected batch['imgs'] to have shape [T,3,H,W] or [B,T,3,H,W], got {tuple(imgs.shape)}"
+        )
+
+    out: Dict[str, Any] = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor) and key in {"imgs", "Ks", "c2ws", "input_mask", "frame_ids"}:
+            out[key] = value.unsqueeze(0)
+        elif isinstance(value, torch.Tensor) and key in {"scene_scale", "num_input_views"}:
+            out[key] = value.reshape(1)
+        else:
+            out[key] = value
+    return out
+
+
+def _resolve_device(bundle: SevaBundle, device: Optional[torch.device | str]) -> torch.device:
+    if device is not None:
+        return torch.device(device)
+    return bundle.device
+
+
+def _get_autocast_context(
+    device: torch.device,
+    dtype: Optional[torch.dtype],
+):
+    if device.type != "cuda" or dtype is None:
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=dtype)
+
+
+def _expand_bt(coeff: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    """Expand [B, T] coefficients to [B, T, 1, 1, 1] for latent arithmetic."""
+    if coeff.dim() != 2:
+        raise ValueError(f"Expected coeff with shape [B, T], got {tuple(coeff.shape)}")
+    return coeff[..., None, None, None].to(dtype=like.dtype, device=like.device)
+
+
+def _encode_images_with_ae(
+    ae: nn.Module,
+    imgs: torch.Tensor,
+    *,
+    encoding_t: int = 1,
+    sample_posterior: bool = False,
+    latent_scaling_factor: float = 1.0,
+) -> torch.Tensor:
+    """Encode [B, T, 3, H, W] images into [B, T, C, h, w] latents.
+
+    This helper is intentionally permissive because different autoencoder
+    wrappers expose slightly different `encode()` return types:
+      - Tensor directly
+      - a posterior object with .sample() / .mode()
+      - a tuple/list where the first item is the latent tensor
+    """
+    if imgs.dim() != 5:
+        raise ValueError(f"imgs must have shape [B, T, 3, H, W], got {tuple(imgs.shape)}")
+
+    B, T = imgs.shape[:2]
+    x = imgs.flatten(0, 1)
+
+    try:
+        encoded = ae.encode(x, encoding_t)
+    except TypeError:
+        encoded = ae.encode(x)
+
+    if isinstance(encoded, torch.Tensor):
+        latents = encoded
+    elif isinstance(encoded, (tuple, list)) and encoded:
+        first = encoded[0]
+        if not isinstance(first, torch.Tensor):
+            raise TypeError(
+                f"ae.encode(...) returned {type(encoded)} whose first element is {type(first)}, expected Tensor"
+            )
+        latents = first
+    elif hasattr(encoded, "sample") or hasattr(encoded, "mode"):
+        if sample_posterior and hasattr(encoded, "sample"):
+            latents = encoded.sample()
+        elif hasattr(encoded, "mode"):
+            latents = encoded.mode()
+        elif hasattr(encoded, "sample"):
+            latents = encoded.sample()
+        else:
+            raise TypeError("Unsupported AE posterior object.")
+    else:
+        raise TypeError(
+            "ae.encode(...) must return a Tensor, a tuple/list containing a Tensor, "
+            "or an object with .sample() / .mode()."
+        )
+
+    if not isinstance(latents, torch.Tensor):
+        raise TypeError(f"Encoded latents must be a Tensor, got {type(latents)}")
+    if latents.dim() != 4:
+        raise ValueError(f"Encoded latents must have shape [B*T, C, h, w], got {tuple(latents.shape)}")
+
+    latents = latents * float(latent_scaling_factor)
+    return latents.view(B, T, *latents.shape[1:])
+
+
+def sample_timesteps(
+    batch_shape: tuple[int, int],
+    *,
+    device: torch.device | str,
+    dtype: torch.dtype = torch.float32,
+    min_t: float = 1e-4,
+    max_t: float = 1.0 - 1e-4,
+) -> torch.Tensor:
+    """Sample continuous training timesteps with shape [B, T]."""
+    if not (0.0 <= min_t < max_t <= 1.0):
+        raise ValueError(f"Expected 0 <= min_t < max_t <= 1, got {min_t}, {max_t}")
+    B, T = batch_shape
+    return torch.rand(B, T, device=device, dtype=dtype) * (max_t - min_t) + min_t
+
+
+def schedule_alpha_sigma(
+    t: torch.Tensor,
+    *,
+    schedule: ScheduleName = "cosine_vp",
+    cosine_s: float = 0.008,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map continuous timesteps to clean/noise interpolation coefficients.
+
+    Supported schedules:
+      - cosine_vp: common VP-style cosine interpolation
+      - rf_linear: simple linear interpolation used in rectified-flow style paths
+    """
+    if schedule == "cosine_vp":
+        # Continuous cosine schedule.
+        # alpha^2 + sigma^2 = 1 by construction.
+        angle = (t + cosine_s) / (1.0 + cosine_s) * (torch.pi / 2.0)
+        alpha = torch.cos(angle)
+        sigma = torch.sin(angle)
+        return alpha, sigma
+
+    if schedule == "rf_linear":
+        alpha = 1.0 - t
+        sigma = t
+        return alpha, sigma
+
+    raise ValueError(f"Unsupported schedule: {schedule!r}")
+
+
+def make_noisy_latents(
+    latents: torch.Tensor,
+    noise: torch.Tensor,
+    t: torch.Tensor,
+    *,
+    schedule: ScheduleName = "cosine_vp",
+    cosine_s: float = 0.008,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Construct x_t and return (x_t, alpha, sigma)."""
+    if latents.shape != noise.shape:
+        raise ValueError(
+            f"latents and noise must have the same shape, got {tuple(latents.shape)} and {tuple(noise.shape)}"
+        )
+    alpha, sigma = schedule_alpha_sigma(t, schedule=schedule, cosine_s=cosine_s)
+    x_t = _expand_bt(alpha, latents) * latents + _expand_bt(sigma, latents) * noise
+    return x_t, alpha, sigma
+
+
+def make_training_target(
+    latents: torch.Tensor,
+    noise: torch.Tensor,
+    alpha: torch.Tensor,
+    sigma: torch.Tensor,
+    *,
+    objective: ObjectiveName = "epsilon",
+    schedule: ScheduleName = "cosine_vp",
+) -> torch.Tensor:
+    """Construct the regression target that matches the chosen objective."""
+    alpha_e = _expand_bt(alpha, latents)
+    sigma_e = _expand_bt(sigma, latents)
+
+    if objective == "epsilon":
+        return noise
+    if objective == "x0":
+        return latents
+    if objective == "v":
+        # Common v-pred parameterization for VP-style schedules.
+        return alpha_e * noise - sigma_e * latents
+    if objective == "velocity":
+        if schedule != "rf_linear":
+            raise ValueError(
+                "objective='velocity' is intended for schedule='rf_linear'. "
+                f"Got schedule={schedule!r}."
+            )
+        return noise - latents
+    raise ValueError(f"Unsupported objective: {objective!r}")
+
+
+def build_loss_weights(
+    input_mask: torch.Tensor,
+    *,
+    target_frame_weight: float = 1.0,
+    input_frame_weight: float = 0.0,
+) -> torch.Tensor:
+    """Build per-frame scalar loss weights from the input/target split mask."""
+    if input_mask.dim() != 2:
+        raise ValueError(f"input_mask must have shape [B, T], got {tuple(input_mask.shape)}")
+
+    weights = torch.full(
+        input_mask.shape,
+        fill_value=float(target_frame_weight),
+        dtype=torch.float32,
+        device=input_mask.device,
+    )
+    weights[input_mask.bool()] = float(input_frame_weight)
+    return weights
+
+
+def maybe_apply_cfg_dropout(
+    c: Dict[str, torch.Tensor],
+    uc: Optional[Dict[str, torch.Tensor]],
+    *,
+    cfg_dropout_prob: float,
+) -> Dict[str, torch.Tensor]:
+    """Randomly replace conditional inputs with unconditional ones per batch item.
+
+    This is a lightweight classifier-free-guidance style dropout. It operates on
+    the batch dimension B and applies the same keep/drop decision to all T
+    frames from the same clip.
+    """
+    if cfg_dropout_prob <= 0.0:
+        return c
+    if uc is None:
+        raise ValueError("cfg_dropout_prob > 0 requires unconditional conditioning (uc).")
+    if not (0.0 <= cfg_dropout_prob <= 1.0):
+        raise ValueError(f"cfg_dropout_prob must be in [0, 1], got {cfg_dropout_prob}")
+
+    # Infer batch dimension from one tensor entry.
+    some_key = next(iter(c.keys()))
+    B = c[some_key].shape[0]
+    keep_mask = (torch.rand(B, device=c[some_key].device) >= cfg_dropout_prob)
+
+    mixed: Dict[str, torch.Tensor] = {}
+    for key, value in c.items():
+        if key not in uc:
+            mixed[key] = value
+            continue
+
+        # Broadcast [B] keep mask to [B, 1, 1, ...]
+        shape = [B] + [1] * (value.dim() - 1)
+        keep = keep_mask.view(*shape)
+        mixed[key] = torch.where(keep, value, uc[key])
+    return mixed
+
+
+def reduce_weighted_mse(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (scalar_loss, per_item_mse[B,T])."""
+    if pred.shape != target.shape:
+        raise ValueError(f"pred and target must match, got {tuple(pred.shape)} and {tuple(target.shape)}")
+    if pred.dim() != 5:
+        raise ValueError(f"Expected pred/target with shape [B, T, C, h, w], got {tuple(pred.shape)}")
+    if weights.shape != pred.shape[:2]:
+        raise ValueError(
+            f"weights must have shape [B, T] matching pred/target, got {tuple(weights.shape)}"
+        )
+
+    mse_per_item = (pred.float() - target.float()).pow(2).mean(dim=(2, 3, 4))
+    weighted = mse_per_item * weights.float()
+    denom = weights.float().sum().clamp_min(1e-8)
+    loss = weighted.sum() / denom
+    return loss, mse_per_item
+
+
+def compute_seva_diffusion_loss(
+    *,
+    bundle: SevaBundle,
+    batch: Dict[str, Any],
+    device: Optional[torch.device | str] = None,
+    latent_downsample_factor: int = 8,
+    latent_scaling_factor: float = 1.0,
+    encoding_t: int = 1,
+    sample_posterior: bool = False,
+    camera_scale: float = 2.0,
+    reference_c2ws_key: Optional[str] = None,
+    schedule: ScheduleName = "cosine_vp",
+    objective: ObjectiveName = "epsilon",
+    cosine_s: float = 0.008,
+    timestep_dtype: torch.dtype = torch.float32,
+    min_t: float = 1e-4,
+    max_t: float = 1.0 - 1e-4,
+    target_frame_weight: float = 1.0,
+    input_frame_weight: float = 0.0,
+    cfg_dropout_prob: float = 0.0,
+    return_unconditional: bool = True,
+    conditioner_no_grad: Optional[bool] = None,
+    encoder_no_grad: Optional[bool] = None,
+    autocast_dtype: Optional[torch.dtype] = None,
+    include_replace_in_conditioning: bool = False,
+) -> DiffusionLossOutput:
+    """Compute one starter diffusion loss for SEVA.
+
+    This is intentionally a *training starter* rather than a claim of being the
+    exact unpublished internal SEVA loss. It is designed to fit the current
+    files you already validated:
+      - clip_dataset.py
+      - conditioning.py
+      - model_factory.py
+
+    Expected workflow:
+      1. Encode full clips to latents with bundle.ae.
+      2. Build conditioning with bundle.conditioner.
+      3. Sample continuous timesteps.
+      4. Add noise according to the chosen schedule.
+      5. Predict epsilon / x0 / v / velocity with bundle.wrapper.
+      6. Compute a weighted loss, usually emphasizing target frames.
+    """
+    if bundle.conditioner is None:
+        raise ValueError(
+            "compute_seva_diffusion_loss requires bundle.conditioner. "
+            "Build the bundle with build_conditioner=True."
+        )
+    if bundle.ae is None:
+        raise ValueError(
+            "compute_seva_diffusion_loss requires bundle.ae so it can encode images to latents."
+        )
+
+    batch = _ensure_batched_clip_batch(batch)
+    device_obj = _resolve_device(bundle, device)
+
+    imgs = _require_tensor(batch, "imgs").to(device_obj)
+    input_mask = _require_tensor(batch, "input_mask").bool().to(device_obj)
+    B, T = imgs.shape[:2]
+
+    cond_encoder_no_grad = (
+        True if conditioner_no_grad is None else bool(conditioner_no_grad)
+    )
+    ae_encoder_no_grad = (
+        (not bundle.train_ae) if encoder_no_grad is None else bool(encoder_no_grad)
+    )
+
+    conditioning = build_seva_conditioning(
+        batch=batch,
+        conditioner=bundle.conditioner,
+        ae=bundle.ae if include_replace_in_conditioning else None,
+        encoding_t=encoding_t,
+        camera_scale=camera_scale,
+        latent_downsample_factor=latent_downsample_factor,
+        device=device_obj,
+        reference_c2ws_key=reference_c2ws_key,
+        return_unconditional=return_unconditional,
+        conditioner_no_grad=cond_encoder_no_grad,
+        encoder_no_grad=ae_encoder_no_grad,
+    )
+
+    c_for_training = maybe_apply_cfg_dropout(
+        conditioning.c,
+        conditioning.uc,
+        cfg_dropout_prob=cfg_dropout_prob,
+    )
+    flat_c = flatten_conditioning_for_model(c_for_training)
+
+    ae_context = torch.no_grad() if ae_encoder_no_grad else nullcontext()
+    with ae_context:
+        latents = _encode_images_with_ae(
+            bundle.ae,
+            imgs,
+            encoding_t=encoding_t,
+            sample_posterior=sample_posterior,
+            latent_scaling_factor=latent_scaling_factor,
+        )
+
+    noise = torch.randn_like(latents)
+    timesteps = sample_timesteps(
+        (B, T),
+        device=device_obj,
+        dtype=timestep_dtype,
+        min_t=min_t,
+        max_t=max_t,
+    )
+    noisy_latents, alpha, sigma = make_noisy_latents(
+        latents,
+        noise,
+        timesteps,
+        schedule=schedule,
+        cosine_s=cosine_s,
+    )
+    target = make_training_target(
+        latents,
+        noise,
+        alpha,
+        sigma,
+        objective=objective,
+        schedule=schedule,
+    )
+
+    x = noisy_latents.flatten(0, 1)
+    target_flat = target.flatten(0, 1)
+
+    moved_c: Dict[str, torch.Tensor] = {}
+    for key, value in flat_c.items():
+        moved_c[key] = value.to(device=device_obj)
+
+    # Use continuous timesteps directly for the current wrapper.
+    t_flat = timesteps.flatten(0, 1).to(device=device_obj)
+
+    forward_context = _get_autocast_context(device_obj, autocast_dtype)
+    with forward_context:
+        pred = bundle.wrapper(x, t_flat, c=moved_c, num_frames=T)
+
+    pred_bt = pred.view(B, T, *pred.shape[1:])
+    target_bt = target_flat.view(B, T, *target_flat.shape[1:])
+
+    weights = build_loss_weights(
+        input_mask,
+        target_frame_weight=target_frame_weight,
+        input_frame_weight=input_frame_weight,
+    )
+    loss, mse_per_item = reduce_weighted_mse(pred_bt, target_bt, weights)
+
+    return DiffusionLossOutput(
+        loss=loss,
+        mse_per_item=mse_per_item,
+        weights=weights,
+        pred=pred,
+        target=target_flat,
+        latents=latents,
+        noisy_latents=noisy_latents,
+        noise=noise,
+        timesteps=timesteps,
+        alpha=alpha,
+        sigma=sigma,
+        conditioning=conditioning,
+        flat_conditioning=flat_c,
+    )
+
+
+class SevaDiffusionLoss(nn.Module):
+    """Thin reusable nn.Module wrapper for compute_seva_diffusion_loss()."""
+
+    def __init__(
+        self,
+        *,
+        latent_downsample_factor: int = 8,
+        latent_scaling_factor: float = 1.0,
+        encoding_t: int = 1,
+        sample_posterior: bool = False,
+        camera_scale: float = 2.0,
+        schedule: ScheduleName = "cosine_vp",
+        objective: ObjectiveName = "epsilon",
+        cosine_s: float = 0.008,
+        timestep_dtype: torch.dtype = torch.float32,
+        min_t: float = 1e-4,
+        max_t: float = 1.0 - 1e-4,
+        target_frame_weight: float = 1.0,
+        input_frame_weight: float = 0.0,
+        cfg_dropout_prob: float = 0.0,
+        return_unconditional: bool = True,
+        conditioner_no_grad: Optional[bool] = None,
+        encoder_no_grad: Optional[bool] = None,
+        autocast_dtype: Optional[torch.dtype] = None,
+        include_replace_in_conditioning: bool = False,
+    ) -> None:
+        super().__init__()
+        self.latent_downsample_factor = int(latent_downsample_factor)
+        self.latent_scaling_factor = float(latent_scaling_factor)
+        self.encoding_t = int(encoding_t)
+        self.sample_posterior = bool(sample_posterior)
+        self.camera_scale = float(camera_scale)
+        self.schedule = schedule
+        self.objective = objective
+        self.cosine_s = float(cosine_s)
+        self.timestep_dtype = timestep_dtype
+        self.min_t = float(min_t)
+        self.max_t = float(max_t)
+        self.target_frame_weight = float(target_frame_weight)
+        self.input_frame_weight = float(input_frame_weight)
+        self.cfg_dropout_prob = float(cfg_dropout_prob)
+        self.return_unconditional = bool(return_unconditional)
+        self.conditioner_no_grad = conditioner_no_grad
+        self.encoder_no_grad = encoder_no_grad
+        self.autocast_dtype = autocast_dtype
+        self.include_replace_in_conditioning = bool(include_replace_in_conditioning)
+
+    def forward(
+        self,
+        *,
+        bundle: SevaBundle,
+        batch: Dict[str, Any],
+        device: Optional[torch.device | str] = None,
+        reference_c2ws_key: Optional[str] = None,
+    ) -> DiffusionLossOutput:
+        return compute_seva_diffusion_loss(
+            bundle=bundle,
+            batch=batch,
+            device=device,
+            latent_downsample_factor=self.latent_downsample_factor,
+            latent_scaling_factor=self.latent_scaling_factor,
+            encoding_t=self.encoding_t,
+            sample_posterior=self.sample_posterior,
+            camera_scale=self.camera_scale,
+            reference_c2ws_key=reference_c2ws_key,
+            schedule=self.schedule,
+            objective=self.objective,
+            cosine_s=self.cosine_s,
+            timestep_dtype=self.timestep_dtype,
+            min_t=self.min_t,
+            max_t=self.max_t,
+            target_frame_weight=self.target_frame_weight,
+            input_frame_weight=self.input_frame_weight,
+            cfg_dropout_prob=self.cfg_dropout_prob,
+            return_unconditional=self.return_unconditional,
+            conditioner_no_grad=self.conditioner_no_grad,
+            encoder_no_grad=self.encoder_no_grad,
+            autocast_dtype=self.autocast_dtype,
+            include_replace_in_conditioning=self.include_replace_in_conditioning,
+        )
+
+
+__all__ = [
+    "DiffusionLossOutput",
+    "SevaDiffusionLoss",
+    "build_loss_weights",
+    "compute_seva_diffusion_loss",
+    "make_noisy_latents",
+    "make_training_target",
+    "sample_timesteps",
+    "schedule_alpha_sigma",
+]

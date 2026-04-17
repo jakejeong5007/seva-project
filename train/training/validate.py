@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
+from typing import Callable, Optional
+
+import torch
+from torch.utils.data import DataLoader
+
+from train.training.diffusion_loss import compute_seva_diffusion_loss
+from train.training.model_factory import SevaBundle
+
+
+@dataclass(frozen=True)
+class ValidationConfig:
+    latent_downsample_factor: int = 8
+    latent_scaling_factor: float = 1.0
+    encoding_t: int = 1
+    sample_posterior: bool = False
+    camera_scale: float = 2.0
+    schedule: str = "cosine_vp"
+    objective: str = "epsilon"
+    target_frame_weight: float = 1.0
+    input_frame_weight: float = 0.0
+    val_batches: int = 4
+    autocast_dtype: Optional[torch.dtype] = None
+
+
+def _restore_module_mode(module: Optional[torch.nn.Module], was_training: bool) -> None:
+    if module is None:
+        return
+    if was_training:
+        module.train()
+    else:
+        module.eval()
+
+
+@torch.no_grad()
+def evaluate(
+    *,
+    bundle: SevaBundle,
+    loader: Optional[DataLoader],
+    device: torch.device,
+    config: ValidationConfig,
+    sdpa_context_factory: Callable[[], AbstractContextManager[object]],
+) -> Optional[float]:
+    if loader is None:
+        return None
+
+    backbone_was_training = bundle.backbone.training
+    conditioner_was_training = (
+        None if bundle.conditioner is None else bundle.conditioner.training
+    )
+    ae_was_training = None if bundle.ae is None else bundle.ae.training
+
+    bundle.backbone.eval()
+    if bundle.conditioner is not None:
+        bundle.conditioner.eval()
+    if bundle.ae is not None and not bundle.train_ae:
+        bundle.ae.eval()
+
+    total_loss = 0.0
+    count = 0
+    for batch in loader:
+        with sdpa_context_factory():
+            loss_out = compute_seva_diffusion_loss(
+                bundle=bundle,
+                batch=batch,
+                device=device,
+                latent_downsample_factor=config.latent_downsample_factor,
+                latent_scaling_factor=config.latent_scaling_factor,
+                encoding_t=config.encoding_t,
+                sample_posterior=config.sample_posterior,
+                camera_scale=config.camera_scale,
+                schedule=config.schedule,
+                objective=config.objective,
+                target_frame_weight=config.target_frame_weight,
+                input_frame_weight=config.input_frame_weight,
+                cfg_dropout_prob=0.0,
+                return_unconditional=True,
+                conditioner_no_grad=not bundle.train_conditioner,
+                encoder_no_grad=not bundle.train_ae,
+                autocast_dtype=config.autocast_dtype,
+                include_replace_in_conditioning=False,
+            )
+        total_loss += loss_out.loss.detach().float().item()
+        count += 1
+        if count >= config.val_batches:
+            break
+
+    _restore_module_mode(bundle.backbone, backbone_was_training)
+    _restore_module_mode(bundle.conditioner, conditioner_was_training)
+    _restore_module_mode(bundle.ae, ae_was_training)
+
+    return total_loss / max(count, 1)

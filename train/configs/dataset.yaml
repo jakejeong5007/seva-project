@@ -1,0 +1,16 @@
+dataset:
+  name: dl3dv_parsed_seva
+  root: /path/to/dl3dv_parsed
+  train_split: train
+  val_split: val
+
+  total_frames: 8
+  num_input_views: "1"
+  image_height: 576
+  image_width: 576
+  normalize_intrinsics: true
+
+  batch_size: 1
+  num_workers: 0
+  shuffle_train: true
+  shuffle_val: false
