@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -78,6 +78,99 @@ def _find_scene_dirs(dataset_root: Path, split: Optional[str]) -> List[Path]:
     return scene_dirs
 
 
+def _filter_scene_dirs(
+    scene_dirs: Sequence[Path],
+    scene_names: Optional[Sequence[str]],
+) -> List[Path]:
+    if scene_names is None:
+        return list(scene_dirs)
+
+    requested = {str(name) for name in scene_names}
+    filtered = [scene_dir for scene_dir in scene_dirs if scene_dir.name in requested]
+    if not filtered:
+        raise FileNotFoundError(
+            f"None of the requested scenes {sorted(requested)} were found."
+        )
+    return filtered
+
+
+def find_scene_dir(
+    dataset_root: str | Path,
+    scene_name: str,
+    *,
+    split: Optional[str] = None,
+) -> Path:
+    scene_dirs = _find_scene_dirs(Path(dataset_root), split=split)
+    filtered = _filter_scene_dirs(scene_dirs, [scene_name])
+    if len(filtered) != 1:
+        raise FileNotFoundError(f"Could not uniquely resolve scene {scene_name!r}.")
+    return filtered[0]
+
+
+def choose_num_input_views_for_preset(
+    available: Sequence[int],
+    *,
+    preset: Literal["quality", "proof"],
+    requested: Optional[int] = None,
+) -> int:
+    values = sorted({int(x) for x in available})
+    if not values:
+        raise ValueError("Scene has no train_test_split_*.json files.")
+
+    if requested is not None:
+        requested = int(requested)
+        if requested not in values:
+            raise ValueError(
+                f"Requested num_input_views={requested} is unavailable. "
+                f"Available splits: {values}"
+            )
+        return requested
+
+    if preset == "proof":
+        if 1 in values:
+            return 1
+        return min(values)
+
+    return max(values)
+
+
+def inspect_scene_split(
+    scene_dir: str | Path,
+    *,
+    num_input_views: Optional[int] = None,
+    normalize_world: bool = False,
+) -> Dict[str, Any]:
+    parser = ReconfusionParser(str(Path(scene_dir)), normalize=normalize_world)
+    available_num_input_views = sorted(
+        int(key) for key in parser.splits_per_num_input_frames.keys()
+    )
+    train_ids: List[int] = []
+    test_ids: List[int] = []
+    if num_input_views is not None:
+        split_dict = parser.splits_per_num_input_frames[int(num_input_views)]
+        train_ids = [int(x) for x in split_dict["train_ids"]]
+        test_ids = [int(x) for x in split_dict["test_ids"]]
+    return {
+        "scene_dir": str(Path(scene_dir)),
+        "scene_name": Path(scene_dir).name,
+        "available_num_input_views": available_num_input_views,
+        "num_input_views": (
+            None if num_input_views is None else int(num_input_views)
+        ),
+        "train_ids": train_ids,
+        "test_ids": test_ids,
+        "num_total_frames": len(train_ids) + len(test_ids),
+    }
+
+
+def _get_wh_with_fixed_shortest_side(w: int, h: int, size: int) -> tuple[int, int]:
+    if size <= 0:
+        return w, h
+    if w < h:
+        return size, int(round(size * h / w))
+    return int(round(size * w / h)), size
+
+
 def _pil_to_tensor(img: Image.Image) -> torch.Tensor:
     arr = np.asarray(img, dtype=np.float32)
     if arr.ndim == 2:
@@ -91,6 +184,7 @@ def _resize_image_and_K(
     image_path: Path,
     K: np.ndarray,
     target_hw: Optional[Tuple[int, int]],
+    target_short_side: Optional[int],
     normalize_intrinsics: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     with Image.open(image_path) as img:
@@ -99,7 +193,19 @@ def _resize_image_and_K(
 
         K_out = np.array(K, dtype=np.float32, copy=True)
 
-        if target_hw is not None:
+        if target_short_side is not None:
+            target_w, target_h = _get_wh_with_fixed_shortest_side(
+                orig_w,
+                orig_h,
+                int(target_short_side),
+            )
+            if (orig_h, orig_w) != (target_h, target_w):
+                scale_x = float(target_w) / float(orig_w)
+                scale_y = float(target_h) / float(orig_h)
+                K_out[0, :] *= scale_x
+                K_out[1, :] *= scale_y
+                img = img.resize((target_w, target_h), resample=Image.BILINEAR) # type: ignore
+        elif target_hw is not None:
             target_h, target_w = target_hw
             if (orig_h, orig_w) != (target_h, target_w):
                 scale_x = float(target_w) / float(orig_w)
@@ -143,9 +249,12 @@ class SevaClipDataset(Dataset):
         num_input_views: int | Sequence[int] = (1, 6),
         total_frames: Optional[int] = 8,
         target_hw: Optional[Tuple[int, int]] = (576, 576),
+        target_short_side: Optional[int] = None,
         normalize_world: bool = False,
         normalize_intrinsics: bool = True,
         shuffle_test_frames: bool = True,
+        frame_selection_mode: Literal["clip", "img2trajvid"] = "clip",
+        scene_names: Optional[Sequence[str]] = None,
         parser_cache_size: int = 16,
         seed: int = 42,
     ) -> None:
@@ -153,7 +262,10 @@ class SevaClipDataset(Dataset):
 
         self.dataset_root = Path(dataset_root)
         self.split = split
-        self.scene_dirs = _find_scene_dirs(self.dataset_root, split=split)
+        self.scene_dirs = _filter_scene_dirs(
+            _find_scene_dirs(self.dataset_root, split=split),
+            scene_names,
+        )
         if not self.scene_dirs:
             raise FileNotFoundError(
                 f"No SEVA scene directories found under {self.dataset_root}"
@@ -168,9 +280,11 @@ class SevaClipDataset(Dataset):
 
         self.total_frames = total_frames
         self.target_hw = target_hw
+        self.target_short_side = target_short_side
         self.normalize_world = normalize_world
         self.normalize_intrinsics = normalize_intrinsics
         self.shuffle_test_frames = shuffle_test_frames
+        self.frame_selection_mode = frame_selection_mode
         self.parser_cache_size = max(int(parser_cache_size), 0)
         self.seed = int(seed)
         self._parser_cache: Dict[str, ReconfusionParser] = {}
@@ -255,14 +369,20 @@ class SevaClipDataset(Dataset):
             if len(test_ids) <= num_targets:
                 selected_test_ids = list(test_ids)
             else:
-                if self.shuffle_test_frames:
+                if self.frame_selection_mode == "img2trajvid":
+                    selected_test_ids = list(test_ids[:num_targets])
+                elif self.shuffle_test_frames:
                     selected_test_ids = rng.sample(test_ids, k=num_targets)
                 else:
                     selected_test_ids = list(test_ids[:num_targets])
 
-        all_ids = sorted(input_ids + selected_test_ids)
-        input_id_set = set(input_ids)
-        input_mask = [frame_id in input_id_set for frame_id in all_ids]
+        if self.frame_selection_mode == "img2trajvid":
+            all_ids = list(input_ids) + list(selected_test_ids)
+            input_mask = [True] * len(input_ids) + [False] * len(selected_test_ids)
+        else:
+            all_ids = sorted(input_ids + selected_test_ids)
+            input_id_set = set(input_ids)
+            input_mask = [frame_id in input_id_set for frame_id in all_ids]
 
         return all_ids, input_ids, selected_test_ids, input_mask
 
@@ -285,6 +405,7 @@ class SevaClipDataset(Dataset):
                 image_path=image_path,
                 K=K,
                 target_hw=self.target_hw,
+                target_short_side=self.target_short_side,
                 normalize_intrinsics=self.normalize_intrinsics,
             )
             imgs.append(img_tensor)

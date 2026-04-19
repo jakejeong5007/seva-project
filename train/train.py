@@ -21,7 +21,13 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from seva.modules.autoencoder import AutoEncoder as SevaAutoEncoder
-from train.data.clip_dataset import SevaClipDataset, seva_clip_collate
+from train.data.clip_dataset import (
+    SevaClipDataset,
+    choose_num_input_views_for_preset,
+    find_scene_dir,
+    inspect_scene_split,
+    seva_clip_collate,
+)
 from train.training.diffusion_loss import compute_seva_diffusion_loss
 from train.training.model_factory import (
     SevaBundle,
@@ -101,6 +107,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=576)
     parser.add_argument("--width", type=int, default=576)
     parser.add_argument(
+        "--l_short",
+        type=int,
+        default=None,
+        help=(
+            "Resize the shortest image side to this value while preserving aspect ratio. "
+            "When set, overrides the fixed --height/--width resize used by training."
+        ),
+    )
+    parser.add_argument(
         "--normalize_intrinsics",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -171,6 +186,28 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Cache the first training batch and reuse it every step for debugging.",
+    )
+    parser.add_argument(
+        "--match_render_scene",
+        type=str,
+        default=None,
+        help=(
+            "Overfit a single scene using the same scene split/order as "
+            "scripts/render_compare.py."
+        ),
+    )
+    parser.add_argument(
+        "--match_render_preset",
+        type=str,
+        default="quality",
+        choices=["quality", "proof"],
+        help="Split-selection preset used together with --match_render_scene.",
+    )
+    parser.add_argument(
+        "--match_render_num_inputs",
+        type=int,
+        default=None,
+        help="Override the split selected by --match_render_preset.",
     )
 
     parser.add_argument(
@@ -352,21 +389,27 @@ def build_dataloader(
     total_frames: int,
     height: int,
     width: int,
+    l_short: Optional[int],
     normalize_intrinsics: bool,
     shuffle: bool,
     seed: int,
     batch_size: int,
     num_workers: int,
+    frame_selection_mode: str = "clip",
+    scene_names: Optional[tuple[str, ...]] = None,
 ) -> DataLoader:
     dataset = SevaClipDataset(
         dataset_root=dataset_root,
         split=split,
         num_input_views=num_input_views,
         total_frames=total_frames,
-        target_hw=(height, width),
+        target_hw=None if l_short is not None else (height, width),
+        target_short_side=l_short,
         normalize_world=False,
         normalize_intrinsics=normalize_intrinsics,
         shuffle_test_frames=True,
+        frame_selection_mode=frame_selection_mode,  # type: ignore[arg-type]
+        scene_names=scene_names,
         seed=seed,
     )
     return DataLoader(
@@ -378,6 +421,35 @@ def build_dataloader(
         pin_memory=torch.cuda.is_available(),
         drop_last=False,
     )
+
+
+def resolve_render_match_overrides(
+    *,
+    dataset_root: Path,
+    split: Optional[str],
+    scene_name: str,
+    preset: str,
+    requested_num_inputs: Optional[int],
+) -> dict[str, Any]:
+    scene_dir = find_scene_dir(dataset_root, scene_name, split=split)
+    metadata_default = inspect_scene_split(scene_dir)
+    available = metadata_default["available_num_input_views"]
+    selected_num_inputs = choose_num_input_views_for_preset(
+        available,
+        preset=preset,  # type: ignore[arg-type]
+        requested=requested_num_inputs,
+    )
+    metadata = inspect_scene_split(scene_dir, num_input_views=selected_num_inputs)
+    return {
+        "scene_names": (scene_name,),
+        "frame_selection_mode": "img2trajvid",
+        "num_input_views": (selected_num_inputs,),
+        "total_frames": metadata["num_total_frames"],
+        "resolved_scene_dir": scene_dir,
+        "resolved_scene_name": scene_name,
+        "resolved_num_input_views": selected_num_inputs,
+        "resolved_available_num_input_views": available,
+    }
 
 
 def resolve_effective_init_mode(args: argparse.Namespace) -> str:
@@ -485,6 +557,32 @@ def main() -> None:
     )
     enable_sdpa_backends_for_cuda()
 
+    dataset_scene_names: Optional[tuple[str, ...]] = None
+    frame_selection_mode = "clip"
+    total_frames = int(args.total_frames)
+    if args.match_render_scene is not None:
+        render_match = resolve_render_match_overrides(
+            dataset_root=args.dataset_root,
+            split=args.train_split,
+            scene_name=args.match_render_scene,
+            preset=args.match_render_preset,
+            requested_num_inputs=args.match_render_num_inputs,
+        )
+        dataset_scene_names = render_match["scene_names"]
+        frame_selection_mode = render_match["frame_selection_mode"]
+        num_input_views = render_match["num_input_views"]
+        total_frames = int(render_match["total_frames"])
+        print(
+            "Match-render mode: "
+            f"scene={render_match['resolved_scene_name']} "
+            f"num_input_views={render_match['resolved_num_input_views']} "
+            f"total_frames={total_frames} "
+            f"available_splits={render_match['resolved_available_num_input_views']}"
+        )
+        if args.l_short is None:
+            args.l_short = 576
+            print("Match-render mode: defaulting --l_short to 576 to mirror demo rendering.")
+
     run_dir = args.output_dir / args.run_name
     checkpoint_dir = run_dir / "checkpoints"
     ensure_dir(run_dir)
@@ -494,14 +592,17 @@ def main() -> None:
         dataset_root=args.dataset_root,
         split=args.train_split,
         num_input_views=num_input_views,
-        total_frames=args.total_frames,
+        total_frames=total_frames,
         height=args.height,
         width=args.width,
+        l_short=args.l_short,
         normalize_intrinsics=args.normalize_intrinsics,
         shuffle=args.shuffle,
         seed=args.seed,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        frame_selection_mode=frame_selection_mode,
+        scene_names=dataset_scene_names,
     )
 
     val_loader: Optional[DataLoader]
@@ -510,14 +611,17 @@ def main() -> None:
             dataset_root=args.dataset_root,
             split=args.val_split,
             num_input_views=num_input_views,
-            total_frames=args.total_frames,
+            total_frames=total_frames,
             height=args.height,
             width=args.width,
+            l_short=args.l_short,
             normalize_intrinsics=args.normalize_intrinsics,
             shuffle=False,
             seed=args.seed + 1,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
+            frame_selection_mode=frame_selection_mode,
+            scene_names=dataset_scene_names,
         )
     except Exception as exc:
         print(f"Validation loader disabled: {exc}")
@@ -582,6 +686,12 @@ def main() -> None:
     config_payload["effective_init_backbone_mode"] = effective_init_mode
     config_payload["bootstrap_lr"] = bootstrap_lr
     config_payload["optimizer_learning_rates"] = active_learning_rates
+    config_payload["resolved_num_input_views"] = list(num_input_views)
+    config_payload["resolved_total_frames"] = total_frames
+    config_payload["resolved_frame_selection_mode"] = frame_selection_mode
+    config_payload["resolved_scene_names"] = (
+        list(dataset_scene_names) if dataset_scene_names is not None else None
+    )
     save_json(run_dir / "config.json", to_jsonable(config_payload))
 
     set_module_modes(bundle)
