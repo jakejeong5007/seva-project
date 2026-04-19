@@ -1,6 +1,8 @@
 import glob
 import os
 import os.path as osp
+from pathlib import Path
+from typing import Any
 
 import fire
 import numpy as np
@@ -52,6 +54,48 @@ DENOISER = DiscreteDenoiser(num_idx=1000, device=device)
 if COMPILE:
     CONDITIONER = torch.compile(CONDITIONER, dynamic=False)
     AE = torch.compile(AE, dynamic=False)
+
+
+def _extract_backbone_state_dict(payload: Any) -> dict[str, torch.Tensor]:
+    if isinstance(payload, dict):
+        for key in ("state_dict", "model", "backbone", "module"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                return _extract_backbone_state_dict(value)
+        if payload and all(isinstance(key, str) for key in payload):
+            return payload  # type: ignore[return-value]
+    raise TypeError("Could not extract a backbone state_dict from the checkpoint.")
+
+
+def _strip_uniform_prefix(
+    state_dict: dict[str, torch.Tensor], prefix: str
+) -> dict[str, torch.Tensor]:
+    if state_dict and all(key.startswith(prefix) for key in state_dict):
+        return {key[len(prefix):]: value for key, value in state_dict.items()}
+    return state_dict
+
+
+def load_backbone_checkpoint(
+    model: SGMWrapper,
+    checkpoint_path: str | os.PathLike[str],
+    *,
+    strict: bool = False,
+) -> None:
+    checkpoint_path = os.fspath(checkpoint_path)
+    payload = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = _extract_backbone_state_dict(payload)
+    for prefix in ("module.", "wrapper.", "backbone.", "model."):
+        state_dict = _strip_uniform_prefix(state_dict, prefix)
+
+    missing, unexpected = model.module.load_state_dict(state_dict, strict=strict)
+    print(
+        "Loaded finetuned backbone from "
+        f"{checkpoint_path}: missing={len(missing)} unexpected={len(unexpected)}"
+    )
+    if missing:
+        print("  first missing keys:", missing[:10])
+    if unexpected:
+        print("  first unexpected keys:", unexpected[:10])
 
 
 def parse_task(
@@ -272,18 +316,25 @@ def main(
     use_traj_prior=False,
     pretrained_model_name_or_path="stabilityai/stable-virtual-camera",
     weight_name="model.safetensors",
+    backbone_ckpt=None,
+    checkpoint_strict=False,
     seed=23,
     **overwrite_options,
 ):
-    MODEL = SGMWrapper(
-        load_model(
-            model_version=version,
-            pretrained_model_name_or_path=pretrained_model_name_or_path,
-            weight_name=weight_name,
-            device="cpu",
-            verbose=True,
-        ).eval()
-    ).to(device)
+    backbone = load_model(
+        model_version=version,
+        pretrained_model_name_or_path=pretrained_model_name_or_path,
+        weight_name=weight_name,
+        device="cpu",
+        verbose=True,
+    ).eval()
+    MODEL = SGMWrapper(backbone).to(device)
+    if backbone_ckpt is not None:
+        load_backbone_checkpoint(
+            MODEL,
+            backbone_ckpt,
+            strict=bool(checkpoint_strict),
+        )
 
     if COMPILE:
         MODEL = torch.compile(MODEL, dynamic=False)
@@ -326,6 +377,9 @@ def main(
         save_path_scene = os.path.join(
             WORK_DIR, task, save_subdir, os.path.splitext(os.path.basename(scene))[0]
         )
+        if backbone_ckpt is not None:
+            ckpt_tag = Path(os.fspath(backbone_ckpt)).stem
+            save_path_scene = os.path.join(save_path_scene, ckpt_tag)
         if options.get("skip_saved", False) and os.path.exists(
             os.path.join(save_path_scene, "transforms.json")
         ):
