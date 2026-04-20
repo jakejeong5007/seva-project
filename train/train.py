@@ -4,18 +4,24 @@ import argparse
 import importlib
 import json
 import math
+import os
 import random
 import sys
 import time
 from contextlib import nullcontext
+from dataclasses import dataclass
+from functools import partial
 from itertools import repeat
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -31,7 +37,6 @@ from train.data.clip_dataset import (
 from train.training.diffusion_loss import compute_seva_diffusion_loss
 from train.training.model_factory import (
     SevaBundle,
-    build_optimizer,
     build_seva_bundle,
     infer_batch_shape,
     summarize_bundle,
@@ -50,6 +55,19 @@ try:
 except Exception:  # pragma: no cover
     SDPBackend = None
     sdpa_kernel = None
+
+try:
+    from torch.distributed.fsdp import (
+        FullyShardedDataParallel,
+        MixedPrecision,
+        ShardingStrategy,
+    )
+    from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+except Exception:  # pragma: no cover - FSDP is optional for CPU-only syntax checks.
+    FullyShardedDataParallel = None
+    MixedPrecision = None
+    ShardingStrategy = None
+    size_based_auto_wrap_policy = None
 
 
 DEFAULT_SCRATCH_LR = 1e-4
@@ -136,6 +154,45 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument(
+        "--distributed_strategy",
+        type=str,
+        default="auto",
+        choices=["auto", "none", "ddp", "fsdp"],
+        help=(
+            "Multi-GPU strategy. Launch ddp/fsdp with torchrun. "
+            "auto selects fsdp when WORLD_SIZE>1, otherwise none."
+        ),
+    )
+    parser.add_argument(
+        "--dist_backend",
+        type=str,
+        default="nccl",
+        choices=["nccl", "gloo"],
+        help="torch.distributed backend used for multi-GPU launch.",
+    )
+    parser.add_argument(
+        "--ddp_find_unused_parameters",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Passed to DistributedDataParallel when --distributed_strategy ddp.",
+    )
+    parser.add_argument(
+        "--fsdp_min_num_params",
+        type=int,
+        default=20_000_000,
+        help=(
+            "FSDP size-based auto-wrap threshold. Lower values shard more "
+            "submodules and may reduce peak memory, at the cost of more communication."
+        ),
+    )
+    parser.add_argument(
+        "--fsdp_sharding_strategy",
+        type=str,
+        default="FULL_SHARD",
+        choices=["FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD"],
+        help="FSDP sharding strategy.",
+    )
+    parser.add_argument(
         "--dtype",
         type=str,
         default="bfloat16",
@@ -221,15 +278,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override the split selected by --match_render_preset.",
     )
-
     parser.add_argument(
         "--match_render_train_frames",
         type=int,
         default=None,
         help=(
             "Maximum number of frames to use for training when --match_render_scene "
-            "is enabled. Defaults to --total_frames. This prevents accidentally "
-            "training on the full render trajectory."
+            "is enabled. Defaults to --total_frames instead of the full render trajectory."
         ),
     )
 
@@ -317,7 +372,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Debug only: fix Gaussian noise sampling for deterministic overfit tests.",
     )
-
     parser.add_argument(
         "--debug_fixed_noise_idx",
         type=int,
@@ -436,6 +490,9 @@ def build_dataloader(
     small_stride_prob: float = 0.2,
     clips_per_scene_per_epoch: int = 16,
     scene_names: Optional[tuple[str, ...]] = None,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> DataLoader:
     dataset = SevaClipDataset(
         dataset_root=dataset_root,
@@ -454,10 +511,22 @@ def build_dataloader(
         scene_names=scene_names,
         seed=seed,
     )
+    sampler = None
+    if distributed:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=False,
+        )
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=num_workers,
         collate_fn=seva_clip_collate,
         pin_memory=torch.cuda.is_available(),
@@ -530,9 +599,9 @@ def format_learning_rates(learning_rates: list[float]) -> str:
 
 def set_module_modes(bundle: SevaBundle) -> None:
     if bundle.train_backbone:
-        bundle.backbone.train()
+        bundle.wrapper.train()
     else:
-        bundle.backbone.eval()
+        bundle.wrapper.eval()
 
     if bundle.conditioner is not None:
         if bundle.train_conditioner:
@@ -559,23 +628,257 @@ def count_finite_grads(module: nn.Module) -> tuple[int, int]:
     return finite, total
 
 
+@dataclass(frozen=True)
+class DistributedContext:
+    strategy: str
+    distributed: bool
+    rank: int
+    local_rank: int
+    world_size: int
+    is_main: bool
+
+
+def distributed_is_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank() -> int:
+    if distributed_is_initialized():
+        return int(dist.get_rank())
+    return 0
+
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+
+def main_print(*args: Any, **kwargs: Any) -> None:
+    if is_main_process():
+        print(*args, **kwargs)
+
+
+def resolve_distributed_context(args: argparse.Namespace) -> DistributedContext:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    requested = str(args.distributed_strategy)
+    if requested == "auto":
+        strategy = "fsdp" if world_size > 1 else "none"
+    else:
+        strategy = requested
+
+    distributed = world_size > 1 and strategy != "none"
+    if strategy in {"ddp", "fsdp"} and world_size <= 1:
+        raise ValueError(
+            f"--distributed_strategy {strategy!r} requires torchrun with WORLD_SIZE>1. "
+            "Use: torchrun --standalone --nproc_per_node=4 -m train.train ..."
+        )
+
+    if distributed:
+        if not torch.cuda.is_available():
+            raise RuntimeError("Distributed SEVA training currently expects CUDA GPUs.")
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend=args.dist_backend, init_method="env://")
+        rank = int(dist.get_rank())
+        world_size = int(dist.get_world_size())
+        local_rank = int(os.environ.get("LOCAL_RANK", str(local_rank)))
+
+    return DistributedContext(
+        strategy=strategy,
+        distributed=distributed,
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        is_main=(rank == 0),
+    )
+
+
+def resolve_device_for_process(args: argparse.Namespace, dist_ctx: DistributedContext) -> torch.device:
+    if dist_ctx.distributed:
+        return torch.device("cuda", dist_ctx.local_rank)
+    if args.device is not None:
+        return torch.device(args.device)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def is_ddp_module(module: nn.Module) -> bool:
+    return isinstance(module, DistributedDataParallel)
+
+
+def is_fsdp_module(module: nn.Module) -> bool:
+    return FullyShardedDataParallel is not None and isinstance(
+        module, FullyShardedDataParallel
+    )
+
+
+def is_parallel_wrapper(module: nn.Module) -> bool:
+    return is_ddp_module(module) or is_fsdp_module(module)
+
+
+def trainable_backbone_container(bundle: SevaBundle) -> nn.Module:
+    if is_parallel_wrapper(bundle.wrapper):
+        return bundle.wrapper
+    return bundle.backbone
+
+
 def collect_trainable_parameters(bundle: SevaBundle) -> list[nn.Parameter]:
     modules: Iterable[Optional[nn.Module]] = (
-        bundle.backbone,
+        trainable_backbone_container(bundle),
         bundle.conditioner,
         bundle.ae,
     )
     params: list[nn.Parameter] = []
+    seen: set[int] = set()
     for module in modules:
         if module is None:
             continue
-        params.extend(parameter for parameter in module.parameters() if parameter.requires_grad)
+        for parameter in module.parameters():
+            if not parameter.requires_grad:
+                continue
+            ident = id(parameter)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            params.append(parameter)
     return params
+
+
+def build_optimizer_from_bundle(
+    bundle: SevaBundle,
+    *,
+    lr: float,
+    weight_decay: float,
+    betas: tuple[float, float],
+    eps: float,
+) -> torch.optim.Optimizer:
+    params = collect_trainable_parameters(bundle)
+    if not params:
+        raise ValueError("No trainable parameters found. Check train_backbone/train_conditioner/train_ae.")
+    return torch.optim.AdamW(
+        [{"params": params, "lr": lr}],
+        lr=lr,
+        betas=betas,
+        eps=eps,
+        weight_decay=weight_decay,
+    )
+
+
+def make_fsdp_mixed_precision(dtype: Optional[torch.dtype]) -> Any:
+    if MixedPrecision is None:
+        return None
+    if dtype not in {torch.float16, torch.bfloat16}:
+        return None
+    return MixedPrecision(param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype)
+
+
+def wrap_bundle_for_distributed(
+    bundle: SevaBundle,
+    *,
+    args: argparse.Namespace,
+    device: torch.device,
+    dtype: Optional[torch.dtype],
+    dist_ctx: DistributedContext,
+) -> None:
+    if not dist_ctx.distributed:
+        return
+
+    if bundle.train_conditioner or bundle.train_ae:
+        raise NotImplementedError(
+            "Distributed training currently wraps only the SEVA backbone/SGMWrapper. "
+            "Keep --no-train_conditioner and --no-train_ae for multi-GPU runs."
+        )
+
+    if dist_ctx.strategy == "ddp":
+        bundle.wrapper = DistributedDataParallel(
+            bundle.wrapper,
+            device_ids=[device.index] if device.type == "cuda" else None,
+            output_device=device.index if device.type == "cuda" else None,
+            find_unused_parameters=bool(args.ddp_find_unused_parameters),
+        )
+        return
+
+    if dist_ctx.strategy == "fsdp":
+        if FullyShardedDataParallel is None or ShardingStrategy is None:
+            raise RuntimeError("PyTorch FSDP is not available in this environment.")
+
+        auto_wrap_policy = None
+        if args.fsdp_min_num_params is not None and int(args.fsdp_min_num_params) > 0:
+            if size_based_auto_wrap_policy is None:
+                raise RuntimeError("size_based_auto_wrap_policy is not available.")
+            auto_wrap_policy = partial(
+                size_based_auto_wrap_policy,
+                min_num_params=int(args.fsdp_min_num_params),
+            )
+
+        sharding_strategy = getattr(ShardingStrategy, args.fsdp_sharding_strategy)
+        bundle.wrapper = FullyShardedDataParallel(
+            bundle.wrapper,
+            auto_wrap_policy=auto_wrap_policy,
+            device_id=device if device.type == "cuda" else None,
+            sharding_strategy=sharding_strategy,
+            mixed_precision=make_fsdp_mixed_precision(dtype),
+            use_orig_params=True,
+            limit_all_gathers=True,
+        )
+        return
+
+    raise ValueError(f"Unknown distributed strategy: {dist_ctx.strategy!r}")
+
+
+def maybe_set_distributed_epoch(loader: DataLoader, epoch: int) -> None:
+    sampler = getattr(loader, "sampler", None)
+    if isinstance(sampler, DistributedSampler):
+        sampler.set_epoch(epoch)
+
+
+def maybe_no_sync_context(module: nn.Module, *, should_sync: bool):
+    if should_sync:
+        return nullcontext()
+    # DDP no_sync saves communication. FSDP no_sync can increase memory because
+    # it delays gradient sharding, so keep FSDP synchronized for memory safety.
+    if is_fsdp_module(module):
+        return nullcontext()
+    no_sync = getattr(module, "no_sync", None)
+    if callable(no_sync):
+        return no_sync()
+    return nullcontext()
+
+
+def clip_grad_norm_for_bundle(
+    bundle: SevaBundle,
+    trainable_parameters: list[nn.Parameter],
+    max_norm: float,
+) -> torch.Tensor:
+    if is_fsdp_module(bundle.wrapper):
+        return bundle.wrapper.clip_grad_norm_(max_norm)
+    return torch.nn.utils.clip_grad_norm_(trainable_parameters, max_norm=max_norm)
+
+
+def reduce_mean_float(value: float, device: torch.device) -> float:
+    if not distributed_is_initialized():
+        return float(value)
+    tensor = torch.tensor(float(value), device=device, dtype=torch.float32)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    tensor /= float(dist.get_world_size())
+    return float(tensor.detach().cpu().item())
+
+
+def distributed_barrier() -> None:
+    if distributed_is_initialized():
+        dist.barrier()
+
+
+def cleanup_distributed() -> None:
+    if distributed_is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def main() -> None:
     args = parse_args()
-    set_seed(args.seed)
+    dist_ctx = resolve_distributed_context(args)
+    set_seed(args.seed + dist_ctx.rank)
 
     num_input_views = parse_num_input_views(args.num_input_views)
     dtype = resolve_dtype(args.dtype)
@@ -585,18 +888,16 @@ def main() -> None:
     bootstrap_lr = resolve_learning_rate(args.lr, effective_init_mode)
 
     if effective_init_mode == "resume" and args.lr is not None:
-        print(
+        main_print(
             "Resume mode restores optimizer state from the checkpoint; "
             "--lr is only used to bootstrap the temporary optimizer and will "
             "be overwritten by the checkpoint state."
         )
     if args.overfit_one_batch and args.log_every != 1:
-        print("Overfit-one-batch mode active; forcing log_every=1.")
+        main_print("Overfit-one-batch mode active; forcing log_every=1.")
         args.log_every = 1
 
-    device = torch.device(args.device) if args.device is not None else torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
+    device = resolve_device_for_process(args, dist_ctx)
     enable_sdpa_backends_for_cuda()
 
     dataset_scene_names: Optional[tuple[str, ...]] = None
@@ -611,33 +912,27 @@ def main() -> None:
             preset=args.match_render_preset,
             requested_num_inputs=args.match_render_num_inputs,
         )
-
         dataset_scene_names = render_match["scene_names"]
         frame_selection_mode = render_match["frame_selection_mode"]
         training_sample_mode = "benchmark_split"
         num_input_views = render_match["num_input_views"]
-
         render_total_frames = int(render_match["total_frames"])
-
         requested_train_frames = (
             args.match_render_train_frames
             if args.match_render_train_frames is not None
             else args.total_frames
         )
         requested_train_frames = int(requested_train_frames)
-
         min_required_frames = int(render_match["resolved_num_input_views"]) + 1
         if requested_train_frames < min_required_frames:
             raise ValueError(
-                f"match-render training needs at least num_input_views + 1 frames. "
+                "match-render training needs at least num_input_views + 1 frames. "
                 f"num_input_views={render_match['resolved_num_input_views']}, "
                 f"requested_train_frames={requested_train_frames}, "
                 f"minimum={min_required_frames}."
             )
-
         total_frames = min(requested_train_frames, render_total_frames)
-
-        print(
+        main_print(
             "Match-render mode: "
             f"scene={render_match['resolved_scene_name']} "
             f"num_input_views={render_match['resolved_num_input_views']} "
@@ -645,15 +940,16 @@ def main() -> None:
             f"render_total_frames={render_total_frames} "
             f"available_splits={render_match['resolved_available_num_input_views']}"
         )
-
         if args.l_short is None:
             args.l_short = 576
-            print("Match-render mode: defaulting --l_short to 576 to mirror demo rendering.")
+            main_print("Match-render mode: defaulting --l_short to 576 to mirror demo rendering.")
 
     run_dir = args.output_dir / args.run_name
     checkpoint_dir = run_dir / "checkpoints"
-    ensure_dir(run_dir)
-    ensure_dir(checkpoint_dir)
+    if dist_ctx.is_main:
+        ensure_dir(run_dir)
+        ensure_dir(checkpoint_dir)
+    distributed_barrier()
 
     train_loader = build_dataloader(
         dataset_root=args.dataset_root,
@@ -673,6 +969,9 @@ def main() -> None:
         small_stride_prob=args.small_stride_prob,
         clips_per_scene_per_epoch=args.clips_per_scene_per_epoch,
         scene_names=dataset_scene_names,
+        distributed=dist_ctx.distributed and not args.overfit_one_batch,
+        rank=dist_ctx.rank,
+        world_size=dist_ctx.world_size,
     )
 
     val_loader: Optional[DataLoader]
@@ -695,9 +994,12 @@ def main() -> None:
             small_stride_prob=args.small_stride_prob,
             clips_per_scene_per_epoch=args.clips_per_scene_per_epoch,
             scene_names=dataset_scene_names,
+            distributed=False,
+            rank=dist_ctx.rank,
+            world_size=dist_ctx.world_size,
         )
     except Exception as exc:
-        print(f"Validation loader disabled: {exc}")
+        main_print(f"Validation loader disabled: {exc}")
         val_loader = None
 
     first_batch = next(iter(train_loader))
@@ -705,7 +1007,7 @@ def main() -> None:
     overfit_batch = first_batch if args.overfit_one_batch else None
     if overfit_batch is not None:
         scene_names = overfit_batch.get("scene_name")
-        print(f"Overfit-one-batch mode: caching first training batch from {scene_names}")
+        main_print(f"Overfit-one-batch mode: caching first training batch from {scene_names}")
 
     ae = build_ae_from_args(args)
     bundle = build_seva_bundle(
@@ -730,7 +1032,22 @@ def main() -> None:
             pretrained_strict=args.pretrained_strict,
         )
 
-    optimizer = build_optimizer(
+    if effective_init_mode == "resume" and dist_ctx.strategy == "fsdp":
+        raise NotImplementedError(
+            "FSDP resume is not implemented in this lightweight trainer. "
+            "Use --init_backbone_mode local_pretrained for a saved backbone, "
+            "or resume in single-GPU/DDP mode."
+        )
+
+    wrap_bundle_for_distributed(
+        bundle,
+        args=args,
+        device=device,
+        dtype=dtype,
+        dist_ctx=dist_ctx,
+    )
+
+    optimizer = build_optimizer_from_bundle(
         bundle,
         lr=bootstrap_lr,
         weight_decay=args.weight_decay,
@@ -749,7 +1066,7 @@ def main() -> None:
             optimizer=optimizer,
             device=device,
         )
-        print(
+        main_print(
             f"Resumed from {args.resume} at epoch={resume_state.epoch}, "
             f"step={resume_state.global_step}"
         )
@@ -766,30 +1083,43 @@ def main() -> None:
     config_payload["resolved_scene_names"] = (
         list(dataset_scene_names) if dataset_scene_names is not None else None
     )
-    save_json(run_dir / "config.json", to_jsonable(config_payload))
+    config_payload["distributed"] = {
+        "strategy": dist_ctx.strategy,
+        "world_size": dist_ctx.world_size,
+        "rank": dist_ctx.rank,
+        "local_rank": dist_ctx.local_rank,
+    }
+    if dist_ctx.is_main:
+        save_json(run_dir / "config.json", to_jsonable(config_payload))
 
     set_module_modes(bundle)
 
-    print("Bundle summary:")
-    for key, value in summarize_bundle(bundle).items():
-        print(f"  {key}: {value}")
-    print(f"Resolved init mode: {effective_init_mode}")
-    if effective_init_mode == "resume":
-        print(f"Bootstrap optimizer learning rate: {bootstrap_lr:.2e}")
-    print(f"Active optimizer learning rate(s): {format_learning_rates(active_learning_rates)}")
+    if dist_ctx.is_main:
+        print("Bundle summary:")
+        for key, value in summarize_bundle(bundle).items():
+            print(f"  {key}: {value}")
+        print(f"Resolved init mode: {effective_init_mode}")
+        print(
+            f"Distributed strategy: {dist_ctx.strategy} "
+            f"world_size={dist_ctx.world_size}"
+        )
+        if effective_init_mode == "resume":
+            print(f"Bootstrap optimizer learning rate: {bootstrap_lr:.2e}")
+        print(f"Active optimizer learning rate(s): {format_learning_rates(active_learning_rates)}")
 
     log_path = run_dir / "train_log.jsonl"
-    if resume_state.global_step == 0 and log_path.exists():
+    if dist_ctx.is_main and resume_state.global_step == 0 and log_path.exists():
         log_path.unlink()
 
     target_total_steps = max(int(args.max_steps), 1)
-    if args.overfit_one_batch:
-        print(f"Training for up to {target_total_steps} optimizer steps on one cached train batch.")
-    else:
-        print(
-            f"Training for up to {target_total_steps} optimizer steps; "
-            f"{len(train_loader)} train batches/epoch."
-        )
+    if dist_ctx.is_main:
+        if args.overfit_one_batch:
+            print(f"Training for up to {target_total_steps} optimizer steps on one cached train batch.")
+        else:
+            print(
+                f"Training for up to {target_total_steps} optimizer steps; "
+                f"{len(train_loader)} train batches/epoch per rank."
+            )
 
     validation_config = ValidationConfig(
         latent_downsample_factor=args.latent_downsample_factor,
@@ -822,6 +1152,7 @@ def main() -> None:
         last_epoch = epoch
         if hasattr(train_loader.dataset, "set_epoch"):
             train_loader.dataset.set_epoch(epoch)
+        maybe_set_distributed_epoch(train_loader, epoch)
         if args.overfit_one_batch:
             batch_iterator = enumerate(repeat(overfit_batch))
         else:
@@ -850,20 +1181,21 @@ def main() -> None:
                     encoder_no_grad=not bundle.train_ae,
                     autocast_dtype=autocast_dtype,
                     include_replace_in_conditioning=True,
-                    debug_fixed_noise_seed=args.debug_fixed_noise_seed,
-                    debug_fixed_noise_idx=args.debug_fixed_noise_idx,
                 )
 
             loss = loss_out.loss / float(args.grad_accum_steps)
-            loss.backward()
+            will_step_after_backward = accum_counter + 1 >= args.grad_accum_steps
+            with maybe_no_sync_context(bundle.wrapper, should_sync=will_step_after_backward):
+                loss.backward()
             accum_counter += 1
 
             optimizer_stepped = False
             grad_norm_value: Optional[float] = None
-            finite_grads, total_grads = count_finite_grads(bundle.backbone)
+            finite_grads, total_grads = count_finite_grads(trainable_backbone_container(bundle))
             if accum_counter >= args.grad_accum_steps:
                 if args.grad_clip_norm is not None and args.grad_clip_norm > 0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                    grad_norm = clip_grad_norm_for_bundle(
+                        bundle,
                         trainable_parameters,
                         max_norm=float(args.grad_clip_norm),
                     )
@@ -880,7 +1212,7 @@ def main() -> None:
                 or global_step == first_step_after_resume
                 or (args.log_every > 0 and global_step % args.log_every == 0)
             )
-            if should_log_step:
+            if should_log_step and dist_ctx.is_main:
                 batch_size, frames, height, width = infer_batch_shape(batch)
                 record: dict[str, Any] = {
                     "epoch": epoch,
@@ -927,16 +1259,18 @@ def main() -> None:
                     sdpa_context_factory=lambda: make_sdpa_context(args.sdpa_backend),
                 )
                 if val_loss is not None:
-                    print(f"validation: step={global_step:06d} val_loss={val_loss:.6f}")
-                    append_jsonl(
-                        log_path,
-                        {
-                            "type": "val",
-                            "epoch": epoch,
-                            "global_step": global_step,
-                            "val_loss": float(val_loss),
-                        },
-                    )
+                    val_loss = reduce_mean_float(float(val_loss), device)
+                    if dist_ctx.is_main:
+                        print(f"validation: step={global_step:06d} val_loss={val_loss:.6f}")
+                        append_jsonl(
+                            log_path,
+                            {
+                                "type": "val",
+                                "epoch": epoch,
+                                "global_step": global_step,
+                                "val_loss": float(val_loss),
+                            },
+                        )
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         save_checkpoint(
@@ -948,7 +1282,8 @@ def main() -> None:
                             best_val_loss=best_val_loss,
                             args=config_payload,
                         )
-                        print(f"saved new best checkpoint: {checkpoint_dir / 'best.pt'}")
+                        if dist_ctx.is_main:
+                            print(f"saved new best checkpoint: {checkpoint_dir / 'best.pt'}")
 
             if optimizer_stepped and args.save_every > 0 and global_step % args.save_every == 0:
                 checkpoint_path = checkpoint_dir / f"step_{global_step:06d}.pt"
@@ -961,7 +1296,8 @@ def main() -> None:
                     best_val_loss=best_val_loss,
                     args=config_payload,
                 )
-                print(f"saved checkpoint: {checkpoint_path}")
+                if dist_ctx.is_main:
+                    print(f"saved checkpoint: {checkpoint_path}")
 
             if optimizer_stepped and global_step >= target_total_steps:
                 stop_training = True
@@ -980,8 +1316,10 @@ def main() -> None:
         best_val_loss=best_val_loss,
         args=config_payload,
     )
-    print(f"saved final checkpoint: {final_checkpoint}")
-    print("training complete")
+    if dist_ctx.is_main:
+        print(f"saved final checkpoint: {final_checkpoint}")
+        print("training complete")
+    cleanup_distributed()
 
 
 if __name__ == "__main__":
