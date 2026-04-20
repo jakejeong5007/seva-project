@@ -7,49 +7,11 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, Literal, Optional
+from seva.sampling import DiscreteDenoiser
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-
-try:
-    from seva.sampling import DiscreteDenoiser
-except Exception:  # pragma: no cover - avoids pulling optional demo deps such as gradio.
-    class DiscreteDenoiser:  # type: ignore[no-redef]
-        """Minimal fallback matching SEVA's DDPM sigma table for training loss.
-
-        The official class lives in seva.sampling, but that module imports demo
-        dependencies in some checkouts. Training only needs idx_to_sigma().
-        """
-
-        def __init__(
-            self,
-            num_idx: int = 1000,
-            device: str | torch.device = "cpu",
-            linear_start: float = 5e-6,
-            linear_end: float = 0.012,
-            log_snr_shift: float = 2.4,
-        ) -> None:
-            if num_idx != 1000:
-                raise ValueError(
-                    "The local DiscreteDenoiser fallback currently supports num_idx=1000 only."
-                )
-            betas = torch.linspace(
-                linear_start**0.5,
-                linear_end**0.5,
-                num_idx,
-                dtype=torch.float64,
-                device=device,
-            ).square()
-            alphas_cumprod = torch.cumprod(1.0 - betas, dim=0)
-            sigmas = torch.sqrt((1.0 - alphas_cumprod) / alphas_cumprod)
-            sigmas = sigmas * torch.exp(torch.tensor(log_snr_shift, dtype=torch.float64, device=device))
-            self.num_idx = int(num_idx)
-            self.device = torch.device(device)
-            self.sigmas = sigmas.to(dtype=torch.float32)
-
-        def idx_to_sigma(self, idx: torch.Tensor | int) -> torch.Tensor:
-            return self.sigmas[idx]
 
 try:
     from train.training.conditioning import (
@@ -68,7 +30,7 @@ except ImportError:
     from model_factory import SevaBundle  # type: ignore
 
 
-ScheduleName = Literal["seva_ddpm", "cosine_vp", "rf_linear"]
+ScheduleName = Literal["cosine_vp", "rf_linear"]
 ObjectiveName = Literal["epsilon", "x0", "v", "velocity"]
 
 
@@ -96,7 +58,7 @@ class DiffusionLossOutput:
         noise:
             Sampled Gaussian noise [B, T, C, h, w].
         timesteps:
-            Continuous timesteps [B, T] for debug schedules, or discrete SEVA/DDPM noise indices [B, T] for schedule="seva_ddpm".
+            Continuous timesteps [B, T].
         alpha:
             Clean-signal coefficient [B, T].
         sigma:
@@ -240,28 +202,23 @@ def _encode_images_with_ae(
     latents = latents * float(latent_scaling_factor)
     return latents.view(B, T, *latents.shape[1:])
 
-
-
 def sample_seva_noise_levels(
-    batch_shape: tuple[int, int],
+    B: int,
+    T: int,
     *,
-    device: torch.device | str,
+    device: torch.device,
     num_idx: int = 1000,
     same_noise_level_per_clip: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, DiscreteDenoiser]:
-    """Sample SEVA/DDPM discrete noise indices and matching sigmas.
-
-    The released SEVA sampler uses ``DiscreteDenoiser`` / ``DDPMDiscretization``
-    with ``log_snr_shift=2.4`` and passes a discrete noise index into the U-Net.
-    For multiview training, the closest match to inference is to use one noise
-    level for the whole clip and broadcast it over T frames.
-
-    Returns:
-        noise_idx: [B, T] LongTensor of discrete timestep/noise indices.
-        sigma:     [B, T] FloatTensor of sigmas corresponding to noise_idx.
-        denoiser:  The ``DiscreteDenoiser`` instance used for the mapping.
     """
-    B, T = batch_shape
+    Returns:
+        noise_idx: [B, T], discrete SEVA/DDPM noise indices
+        sigma:     [B, T], corresponding sigmas
+        denoiser:  SEVA denoiser object used for scaling/index conversion
+
+    Use same_noise_level_per_clip=True to match inference more closely:
+    one diffusion time for the whole multi-view context.
+    """
     denoiser = DiscreteDenoiser(num_idx=num_idx, device=device)
 
     if same_noise_level_per_clip:
@@ -297,16 +254,9 @@ def schedule_alpha_sigma(
     """Map continuous timesteps to clean/noise interpolation coefficients.
 
     Supported schedules:
-      - seva_ddpm: handled in compute_seva_diffusion_loss via DiscreteDenoiser
       - cosine_vp: common VP-style cosine interpolation
       - rf_linear: simple linear interpolation used in rectified-flow style paths
     """
-    if schedule == "seva_ddpm":
-        raise ValueError(
-            "schedule_alpha_sigma() is only for continuous debug schedules. "
-            "Use sample_seva_noise_levels() for schedule='seva_ddpm'."
-        )
-
     if schedule == "cosine_vp":
         # Continuous cosine schedule.
         # alpha^2 + sigma^2 = 1 by construction.
@@ -461,7 +411,7 @@ def compute_seva_diffusion_loss(
     sample_posterior: bool = False,
     camera_scale: float = 2.0,
     reference_c2ws_key: Optional[str] = None,
-    schedule: ScheduleName = "seva_ddpm",
+    schedule: ScheduleName = "cosine_vp",
     objective: ObjectiveName = "epsilon",
     cosine_s: float = 0.008,
     timestep_dtype: torch.dtype = torch.float32,
@@ -474,7 +424,7 @@ def compute_seva_diffusion_loss(
     conditioner_no_grad: Optional[bool] = None,
     encoder_no_grad: Optional[bool] = None,
     autocast_dtype: Optional[torch.dtype] = None,
-    include_replace_in_conditioning: bool = True,
+    include_replace_in_conditioning: bool = False,
 ) -> DiffusionLossOutput:
     """Compute one starter diffusion loss for SEVA.
 
@@ -485,16 +435,13 @@ def compute_seva_diffusion_loss(
       - conditioning.py
       - model_factory.py
 
-    Expected workflow for schedule="seva_ddpm":
+    Expected workflow:
       1. Encode full clips to latents with bundle.ae.
-      2. Build conditioning with CLIP, Plücker coordinates, and clean input-view replacement.
-      3. Sample SEVA/DDPM discrete noise indices and sigmas.
-      4. Add noise as x_sigma = x0 + sigma * epsilon.
-      5. Replace input-view latent slots with clean encoded input latents.
-      6. Apply the released denoiser input scaling c_in.
-      7. Train the raw SGMWrapper to predict epsilon on target frames only.
-
-    The older cosine_vp / rf_linear paths are kept only as generic debug fallbacks.
+      2. Build conditioning with bundle.conditioner.
+      3. Sample continuous timesteps.
+      4. Add noise according to the chosen schedule.
+      5. Predict epsilon / x0 / v / velocity with bundle.wrapper.
+      6. Compute a weighted loss, usually emphasizing target frames.
     """
     if bundle.conditioner is None:
         raise ValueError(
@@ -553,83 +500,44 @@ def compute_seva_diffusion_loss(
 
     noise = torch.randn_like(latents)
 
+    noise_idx, sigma, denoiser = sample_seva_noise_levels(
+        B,
+        T,
+        device=device_obj,
+        num_idx=1000,
+        same_noise_level_per_clip=True,
+    )
+
+    sigma_e = sigma[..., None, None, None].to(device=latents.device, dtype=latents.dtype)
+
+    # SEVA / EDM-style noising: x_sigma = x0 + sigma * eps
+    noisy_latents = latents + sigma_e * noise
+
+    # Flatten [B, T, ...] -> [B*T, ...]
+    x = noisy_latents.flatten(0, 1)
+    target_flat = noise.flatten(0, 1)
+
+    # Move conditioning and handle replacement before SGMWrapper.
     moved_c: Dict[str, torch.Tensor] = {}
     for key, value in flat_c.items():
         moved_c[key] = value.to(device=device_obj)
 
-    if schedule == "seva_ddpm":
-        if objective != "epsilon":
-            raise ValueError(
-                "schedule='seva_ddpm' trains the raw SEVA wrapper as epsilon prediction. "
-                f"Use objective='epsilon', got {objective!r}."
-            )
+    # The released denoiser consumes "replace"; SGMWrapper itself does not.
+    replace = moved_c.pop("replace", None)
+    if replace is not None:
+        replace_x, replace_mask = replace.split((x.shape[1], 1), dim=1)
+        replace_x = replace_x.to(dtype=x.dtype)
+        replace_mask = replace_mask.to(dtype=x.dtype)
+        x = x * (1.0 - replace_mask) + replace_x * replace_mask
 
-        timesteps, sigma, _denoiser = sample_seva_noise_levels(
-            (B, T),
-            device=device_obj,
-            num_idx=1000,
-            same_noise_level_per_clip=True,
-        )
-        sigma_e = _expand_bt(sigma, latents)
+    sigma_flat = sigma.flatten(0, 1).to(device=device_obj, dtype=x.dtype)
+    c_in = torch.rsqrt(sigma_flat[:, None, None, None].square() + 1.0)
 
-        # Match the released SEVA denoiser convention:
-        #   x_sigma = x0 + sigma * eps
-        #   network input = x_sigma * c_in, where c_in = 1 / sqrt(sigma^2 + 1)
-        noisy_latents = latents + sigma_e * noise
-        alpha = torch.ones_like(sigma)
-        target = noise
+    t_flat = noise_idx.flatten(0, 1).to(device=device_obj)
 
-        x = noisy_latents.flatten(0, 1)
-        target_flat = target.flatten(0, 1)
-
-        # SGMWrapper does not consume "replace"; the released DiscreteDenoiser
-        # applies it before calling the network, so do the same here.
-        replace = moved_c.pop("replace", None)
-        if replace is not None:
-            replace_x, replace_mask = replace.split((x.shape[1], 1), dim=1)
-            replace_x = replace_x.to(device=device_obj, dtype=x.dtype)
-            replace_mask = replace_mask.to(device=device_obj, dtype=x.dtype)
-            x = x * (1.0 - replace_mask) + replace_x * replace_mask
-
-        sigma_flat = sigma.flatten(0, 1).to(device=device_obj, dtype=x.dtype)
-        c_in = torch.rsqrt(sigma_flat[:, None, None, None].square() + 1.0)
-        t_flat = timesteps.flatten(0, 1).to(device=device_obj)
-
-        forward_context = _get_autocast_context(device_obj, autocast_dtype)
-        with forward_context:
-            pred = bundle.wrapper(x * c_in, t_flat, c=moved_c, num_frames=T)
-
-    else:
-        timesteps = sample_timesteps(
-            (B, T),
-            device=device_obj,
-            dtype=timestep_dtype,
-            min_t=min_t,
-            max_t=max_t,
-        )
-        noisy_latents, alpha, sigma = make_noisy_latents(
-            latents,
-            noise,
-            timesteps,
-            schedule=schedule,
-            cosine_s=cosine_s,
-        )
-        target = make_training_target(
-            latents,
-            noise,
-            alpha,
-            sigma,
-            objective=objective,
-            schedule=schedule,
-        )
-
-        x = noisy_latents.flatten(0, 1)
-        target_flat = target.flatten(0, 1)
-        t_flat = timesteps.flatten(0, 1).to(device=device_obj)
-
-        forward_context = _get_autocast_context(device_obj, autocast_dtype)
-        with forward_context:
-            pred = bundle.wrapper(x, t_flat, c=moved_c, num_frames=T)
+    forward_context = _get_autocast_context(device_obj, autocast_dtype)
+    with forward_context:
+        pred = bundle.wrapper(x * c_in, t_flat, c=moved_c, num_frames=T)
 
     pred_bt = pred.view(B, T, *pred.shape[1:])
     target_bt = target_flat.view(B, T, *target_flat.shape[1:])
@@ -650,8 +558,8 @@ def compute_seva_diffusion_loss(
         latents=latents,
         noisy_latents=noisy_latents,
         noise=noise,
-        timesteps=timesteps,
-        alpha=alpha,
+        timesteps=noise_idx.float(),
+        alpha=torch.ones_like(sigma),
         sigma=sigma,
         conditioning=conditioning,
         flat_conditioning=flat_c,
@@ -669,7 +577,7 @@ class SevaDiffusionLoss(nn.Module):
         encoding_t: int = 1,
         sample_posterior: bool = False,
         camera_scale: float = 2.0,
-        schedule: ScheduleName = "seva_ddpm",
+        schedule: ScheduleName = "cosine_vp",
         objective: ObjectiveName = "epsilon",
         cosine_s: float = 0.008,
         timestep_dtype: torch.dtype = torch.float32,
@@ -747,7 +655,6 @@ __all__ = [
     "compute_seva_diffusion_loss",
     "make_noisy_latents",
     "make_training_target",
-    "sample_seva_noise_levels",
     "sample_timesteps",
     "schedule_alpha_sigma",
 ]

@@ -320,8 +320,10 @@ def build_value_dict_from_batch(
         input_mask: [B, T] or [T]
 
     Optional:
-        reference_c2ws_key: if provided and present in batch, use that tensor as
-        the centering reference instead of the current clip's c2ws.
+        reference_c2ws_key: if provided and present in batch, use that tensor or
+        list of per-scene tensors as the centering reference instead of the
+        current sampled clip's c2ws. Passing all scene poses better matches the
+        released SEVA eval path.
     """
     batch, squeeze_batch = _maybe_unsqueeze_batch(batch)
     device_obj = _resolve_device(batch, device)
@@ -348,27 +350,51 @@ def build_value_dict_from_batch(
         raise ValueError("imgs, Ks, c2ws, and input_mask must agree on [B, T].")
 
     reference_c2ws = None
+    reference_c2ws_list = None
     if reference_c2ws_key is not None and reference_c2ws_key in batch:
-        reference_c2ws = batch[reference_c2ws_key]
-        if not isinstance(reference_c2ws, torch.Tensor):
-            raise TypeError(
-                f"batch[{reference_c2ws_key!r}] must be a torch.Tensor, got {type(reference_c2ws)}"
-            )
-        reference_c2ws = reference_c2ws.to(device_obj)
-        if reference_c2ws.dim() == 3:
-            reference_c2ws = reference_c2ws.unsqueeze(0)
-        if reference_c2ws.shape[0] not in {1, B}:
-            raise ValueError(
-                f"reference_c2ws batch dimension must be 1 or B={B}, got {reference_c2ws.shape[0]}"
-            )
-        if reference_c2ws.shape[0] == 1 and B > 1:
-            reference_c2ws = reference_c2ws.expand(B, *reference_c2ws.shape[1:])
+        ref_obj = batch[reference_c2ws_key]
+
+        # Collated batches may carry all scene poses as a Python list because
+        # different scenes can have different numbers of source frames.
+        if isinstance(ref_obj, (list, tuple)):
+            if len(ref_obj) != B:
+                raise ValueError(
+                    f"batch[{reference_c2ws_key!r}] must have length B={B}, got {len(ref_obj)}"
+                )
+            reference_c2ws_list = []
+            for item in ref_obj:
+                if isinstance(item, torch.Tensor):
+                    ref_tensor = item.to(device_obj)
+                else:
+                    ref_tensor = torch.as_tensor(item, device=device_obj)
+                if ref_tensor.dim() != 3:
+                    raise ValueError(
+                        f"Each reference_c2ws list item must have shape [N,3/4,4], got {tuple(ref_tensor.shape)}"
+                    )
+                reference_c2ws_list.append(ref_tensor)
+        else:
+            if not isinstance(ref_obj, torch.Tensor):
+                raise TypeError(
+                    f"batch[{reference_c2ws_key!r}] must be a Tensor or list of Tensors, got {type(ref_obj)}"
+                )
+            reference_c2ws = ref_obj.to(device_obj)
+            if reference_c2ws.dim() == 3:
+                reference_c2ws = reference_c2ws.unsqueeze(0)
+            if reference_c2ws.shape[0] not in {1, B}:
+                raise ValueError(
+                    f"reference_c2ws batch dimension must be 1 or B={B}, got {reference_c2ws.shape[0]}"
+                )
+            if reference_c2ws.shape[0] == 1 and B > 1:
+                reference_c2ws = reference_c2ws.expand(B, *reference_c2ws.shape[1:])
 
     resolved_camera_scale = _choose_camera_scale(batch, camera_scale)
 
     value_dicts = []
     for b in range(B):
-        ref_c2ws_b = None if reference_c2ws is None else reference_c2ws[b]
+        if reference_c2ws_list is not None:
+            ref_c2ws_b = reference_c2ws_list[b]
+        else:
+            ref_c2ws_b = None if reference_c2ws is None else reference_c2ws[b]
         value_dicts.append(
             _build_value_dict_single(
                 imgs=imgs[b],

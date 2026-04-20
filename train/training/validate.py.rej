@@ -1,0 +1,11 @@
+--- train/training/validate.py	2026-04-19 23:55:15.530863159 +0000
++++ train/training/validate.py	2026-04-19 23:55:15.543456081 +0000
+@@ -83,7 +85,7 @@
+                 conditioner_no_grad=not bundle.train_conditioner,
+                 encoder_no_grad=not bundle.train_ae,
+                 autocast_dtype=config.autocast_dtype,
+-                include_replace_in_conditioning=False,
++                include_replace_in_conditioning=True,
+             )
+         total_loss += loss_out.loss.detach().float().item()
+         count += 1

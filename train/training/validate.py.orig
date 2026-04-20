@@ -18,8 +18,7 @@ class ValidationConfig:
     encoding_t: int = 1
     sample_posterior: bool = False
     camera_scale: float = 2.0
-    schedule: str = "seva_ddpm"
-    reference_c2ws_key: str = "all_c2ws"
+    schedule: str = "cosine_vp"
     objective: str = "epsilon"
     target_frame_weight: float = 1.0
     input_frame_weight: float = 0.0
@@ -73,7 +72,6 @@ def evaluate(
                 encoding_t=config.encoding_t,
                 sample_posterior=config.sample_posterior,
                 camera_scale=config.camera_scale,
-                reference_c2ws_key=config.reference_c2ws_key,
                 schedule=config.schedule,
                 objective=config.objective,
                 target_frame_weight=config.target_frame_weight,

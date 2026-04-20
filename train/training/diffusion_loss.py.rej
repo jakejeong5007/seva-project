@@ -1,0 +1,126 @@
+--- train/training/diffusion_loss.py	2026-04-19 23:55:15.530282335 +0000
++++ train/training/diffusion_loss.py	2026-04-19 23:55:15.541082617 +0000
+@@ -552,42 +633,84 @@
+         )
+ 
+     noise = torch.randn_like(latents)
+-    timesteps = sample_timesteps(
+-        (B, T),
+-        device=device_obj,
+-        dtype=timestep_dtype,
+-        min_t=min_t,
+-        max_t=max_t,
+-    )
+-    noisy_latents, alpha, sigma = make_noisy_latents(
+-        latents,
+-        noise,
+-        timesteps,
+-        schedule=schedule,
+-        cosine_s=cosine_s,
+-    )
+-    target = make_training_target(
+-        latents,
+-        noise,
+-        alpha,
+-        sigma,
+-        objective=objective,
+-        schedule=schedule,
+-    )
+-
+-    x = noisy_latents.flatten(0, 1)
+-    target_flat = target.flatten(0, 1)
+ 
+     moved_c: Dict[str, torch.Tensor] = {}
+     for key, value in flat_c.items():
+         moved_c[key] = value.to(device=device_obj)
+ 
+-    # Use continuous timesteps directly for the current wrapper.
+-    t_flat = timesteps.flatten(0, 1).to(device=device_obj)
++    if schedule == "seva_ddpm":
++        if objective != "epsilon":
++            raise ValueError(
++                "schedule='seva_ddpm' trains the raw SEVA wrapper as epsilon prediction. "
++                f"Use objective='epsilon', got {objective!r}."
++            )
++
++        timesteps, sigma, _denoiser = sample_seva_noise_levels(
++            (B, T),
++            device=device_obj,
++            num_idx=1000,
++            same_noise_level_per_clip=True,
++        )
++        sigma_e = _expand_bt(sigma, latents)
++
++        # Match the released SEVA denoiser convention:
++        #   x_sigma = x0 + sigma * eps
++        #   network input = x_sigma * c_in, where c_in = 1 / sqrt(sigma^2 + 1)
++        noisy_latents = latents + sigma_e * noise
++        alpha = torch.ones_like(sigma)
++        target = noise
++
++        x = noisy_latents.flatten(0, 1)
++        target_flat = target.flatten(0, 1)
++
++        # SGMWrapper does not consume "replace"; the released DiscreteDenoiser
++        # applies it before calling the network, so do the same here.
++        replace = moved_c.pop("replace", None)
++        if replace is not None:
++            replace_x, replace_mask = replace.split((x.shape[1], 1), dim=1)
++            replace_x = replace_x.to(device=device_obj, dtype=x.dtype)
++            replace_mask = replace_mask.to(device=device_obj, dtype=x.dtype)
++            x = x * (1.0 - replace_mask) + replace_x * replace_mask
++
++        sigma_flat = sigma.flatten(0, 1).to(device=device_obj, dtype=x.dtype)
++        c_in = torch.rsqrt(sigma_flat[:, None, None, None].square() + 1.0)
++        t_flat = timesteps.flatten(0, 1).to(device=device_obj)
++
++        forward_context = _get_autocast_context(device_obj, autocast_dtype)
++        with forward_context:
++            pred = bundle.wrapper(x * c_in, t_flat, c=moved_c, num_frames=T)
++
++    else:
++        timesteps = sample_timesteps(
++            (B, T),
++            device=device_obj,
++            dtype=timestep_dtype,
++            min_t=min_t,
++            max_t=max_t,
++        )
++        noisy_latents, alpha, sigma = make_noisy_latents(
++            latents,
++            noise,
++            timesteps,
++            schedule=schedule,
++            cosine_s=cosine_s,
++        )
++        target = make_training_target(
++            latents,
++            noise,
++            alpha,
++            sigma,
++            objective=objective,
++            schedule=schedule,
++        )
+ 
+-    forward_context = _get_autocast_context(device_obj, autocast_dtype)
+-    with forward_context:
+-        pred = bundle.wrapper(x, t_flat, c=moved_c, num_frames=T)
++        x = noisy_latents.flatten(0, 1)
++        target_flat = target.flatten(0, 1)
++        t_flat = timesteps.flatten(0, 1).to(device=device_obj)
++
++        forward_context = _get_autocast_context(device_obj, autocast_dtype)
++        with forward_context:
++            pred = bundle.wrapper(x, t_flat, c=moved_c, num_frames=T)
+ 
+     pred_bt = pred.view(B, T, *pred.shape[1:])
+     target_bt = target_flat.view(B, T, *target_flat.shape[1:])
+@@ -640,7 +763,7 @@
+         conditioner_no_grad: Optional[bool] = None,
+         encoder_no_grad: Optional[bool] = None,
+         autocast_dtype: Optional[torch.dtype] = None,
+-        include_replace_in_conditioning: bool = False,
++        include_replace_in_conditioning: bool = True,
+     ) -> None:
+         super().__init__()
+         self.latent_downsample_factor = int(latent_downsample_factor)

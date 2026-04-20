@@ -336,6 +336,17 @@ def main() -> None:
         print("No --backbone_ckpt provided, skipping finetuned render.")
         return
 
+    backbone_ckpt = args.backbone_ckpt.resolve()
+    if not backbone_ckpt.exists():
+        available = sorted(repo_root.glob("runs/*/checkpoints/*.pt"))
+        available_str = "\n".join(str(path) for path in available) or "(none found)"
+        raise SystemExit(
+            "Finetuned render skipped because the checkpoint does not exist:\n"
+            f"  {backbone_ckpt}\n"
+            "Available checkpoints under this repo are:\n"
+            f"{available_str}"
+        )
+
     finetuned_command, _ = build_demo_command(
         python_exe=args.python_exe,
         task=args.task,
@@ -345,7 +356,7 @@ def main() -> None:
         seed=args.seed,
         l_short=args.l_short,
         save_subdir=f"{save_prefix}_finetuned",
-        backbone_ckpt=args.backbone_ckpt.resolve(),
+        backbone_ckpt=backbone_ckpt,
         traj_prior=args.traj_prior,
         num_targets=args.num_targets,
         source_view_rank=args.source_view_rank,
