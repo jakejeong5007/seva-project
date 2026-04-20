@@ -300,6 +300,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Training checkpoint path to resume from.",
     )
+    parser.add_argument(
+        "--debug_fixed_noise_seed",
+        type=int,
+        default=None,
+        help="Debug only: fix Gaussian noise sampling for deterministic overfit tests.",
+    )
+
+    parser.add_argument(
+        "--debug_fixed_noise_idx",
+        type=int,
+        default=None,
+        help="Debug only: fix SEVA/DDPM noise index for deterministic overfit tests.",
+    )
     return parser.parse_args()
 
 
@@ -803,6 +816,8 @@ def main() -> None:
                     encoder_no_grad=not bundle.train_ae,
                     autocast_dtype=autocast_dtype,
                     include_replace_in_conditioning=True,
+                    debug_fixed_noise_seed=args.debug_fixed_noise_seed,
+                    debug_fixed_noise_idx=args.debug_fixed_noise_idx,
                 )
 
             loss = loss_out.loss / float(args.grad_accum_steps)
