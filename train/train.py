@@ -378,6 +378,25 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Debug only: fix SEVA/DDPM noise index for deterministic overfit tests.",
     )
+    parser.add_argument(
+        "--activation_checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use torch.utils.checkpoint around the SEVA backbone forward. "
+            "Reduces activation memory at the cost of extra compute."
+        ),
+    )
+
+    parser.add_argument(
+        "--offload_frozen_encoders",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Move the frozen CLIP conditioner and VAE to CPU after conditioning "
+            "is built, before the trainable SEVA backbone forward."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1181,6 +1200,8 @@ def main() -> None:
                     encoder_no_grad=not bundle.train_ae,
                     autocast_dtype=autocast_dtype,
                     include_replace_in_conditioning=True,
+                    use_activation_checkpointing=args.activation_checkpointing,
+                    offload_frozen_encoders=args.offload_frozen_encoders,
                 )
 
             loss = loss_out.loss / float(args.grad_accum_steps)

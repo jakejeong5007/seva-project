@@ -12,6 +12,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import gc
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
+
 try:
     from seva.sampling import DiscreteDenoiser
 except Exception:  # pragma: no cover - avoids pulling optional demo deps such as gradio.
@@ -475,7 +478,9 @@ def compute_seva_diffusion_loss(
     encoder_no_grad: Optional[bool] = None,
     autocast_dtype: Optional[torch.dtype] = None,
     include_replace_in_conditioning: bool = True,
-) -> DiffusionLossOutput:
+    use_activation_checkpointing: bool = False,
+    offload_frozen_encoders: bool = False,
+    ) -> DiffusionLossOutput:
     """Compute one starter diffusion loss for SEVA.
 
     This is intentionally a *training starter* rather than a claim of being the
