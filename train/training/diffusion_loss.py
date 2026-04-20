@@ -248,34 +248,27 @@ def sample_seva_noise_levels(
     device: torch.device | str,
     num_idx: int = 1000,
     same_noise_level_per_clip: bool = True,
-    generator: Optional[torch.Generator] = None,
-    fixed_noise_idx: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, DiscreteDenoiser]:
+    """Sample SEVA/DDPM discrete noise indices and matching sigmas.
+
+    The released SEVA sampler uses ``DiscreteDenoiser`` / ``DDPMDiscretization``
+    with ``log_snr_shift=2.4`` and passes a discrete noise index into the U-Net.
+    For multiview training, the closest match to inference is to use one noise
+    level for the whole clip and broadcast it over T frames.
+
+    Returns:
+        noise_idx: [B, T] LongTensor of discrete timestep/noise indices.
+        sigma:     [B, T] FloatTensor of sigmas corresponding to noise_idx.
+        denoiser:  The ``DiscreteDenoiser`` instance used for the mapping.
+    """
     B, T = batch_shape
     denoiser = DiscreteDenoiser(num_idx=num_idx, device=device)
 
-    if fixed_noise_idx is not None:
-        idx = int(fixed_noise_idx)
-        if idx < 0 or idx >= num_idx:
-            raise ValueError(f"fixed_noise_idx must be in [0, {num_idx - 1}], got {idx}")
-        noise_idx = torch.full((B, T), idx, device=device, dtype=torch.long)
-    elif same_noise_level_per_clip:
-        noise_idx = torch.randint(
-            0,
-            num_idx,
-            (B,),
-            device=device,
-            generator=generator,
-        )
+    if same_noise_level_per_clip:
+        noise_idx = torch.randint(0, num_idx, (B,), device=device)
         noise_idx = noise_idx[:, None].expand(B, T)
     else:
-        noise_idx = torch.randint(
-            0,
-            num_idx,
-            (B, T),
-            device=device,
-            generator=generator,
-        )
+        noise_idx = torch.randint(0, num_idx, (B, T), device=device)
 
     sigma = denoiser.idx_to_sigma(noise_idx)
     return noise_idx, sigma, denoiser
@@ -482,8 +475,6 @@ def compute_seva_diffusion_loss(
     encoder_no_grad: Optional[bool] = None,
     autocast_dtype: Optional[torch.dtype] = None,
     include_replace_in_conditioning: bool = True,
-    debug_fixed_noise_seed: Optional[int] = None,
-    debug_fixed_noise_idx: Optional[int] = None,
 ) -> DiffusionLossOutput:
     """Compute one starter diffusion loss for SEVA.
 
@@ -560,19 +551,7 @@ def compute_seva_diffusion_loss(
             latent_scaling_factor=latent_scaling_factor,
         )
 
-    debug_generator: Optional[torch.Generator] = None
-
-    if debug_fixed_noise_seed is not None:
-        debug_generator = torch.Generator(device=latents.device)
-        debug_generator.manual_seed(int(debug_fixed_noise_seed))
-        noise = torch.randn(
-            latents.shape,
-            device=latents.device,
-            dtype=latents.dtype,
-            generator=debug_generator,
-        )
-    else:
-        noise = torch.randn_like(latents)
+    noise = torch.randn_like(latents)
 
     moved_c: Dict[str, torch.Tensor] = {}
     for key, value in flat_c.items():
@@ -590,8 +569,6 @@ def compute_seva_diffusion_loss(
             device=device_obj,
             num_idx=1000,
             same_noise_level_per_clip=True,
-            generator=debug_generator,
-            fixed_noise_idx=debug_fixed_noise_idx,
         )
         sigma_e = _expand_bt(sigma, latents)
 
