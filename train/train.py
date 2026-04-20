@@ -223,6 +223,17 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--match_render_train_frames",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of frames to use for training when --match_render_scene "
+            "is enabled. Defaults to --total_frames. This prevents accidentally "
+            "training on the full render trajectory."
+        ),
+    )
+
+    parser.add_argument(
         "--train_backbone",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -600,18 +611,41 @@ def main() -> None:
             preset=args.match_render_preset,
             requested_num_inputs=args.match_render_num_inputs,
         )
+
         dataset_scene_names = render_match["scene_names"]
         frame_selection_mode = render_match["frame_selection_mode"]
         training_sample_mode = "benchmark_split"
         num_input_views = render_match["num_input_views"]
-        total_frames = int(render_match["total_frames"])
+
+        render_total_frames = int(render_match["total_frames"])
+
+        requested_train_frames = (
+            args.match_render_train_frames
+            if args.match_render_train_frames is not None
+            else args.total_frames
+        )
+        requested_train_frames = int(requested_train_frames)
+
+        min_required_frames = int(render_match["resolved_num_input_views"]) + 1
+        if requested_train_frames < min_required_frames:
+            raise ValueError(
+                f"match-render training needs at least num_input_views + 1 frames. "
+                f"num_input_views={render_match['resolved_num_input_views']}, "
+                f"requested_train_frames={requested_train_frames}, "
+                f"minimum={min_required_frames}."
+            )
+
+        total_frames = min(requested_train_frames, render_total_frames)
+
         print(
             "Match-render mode: "
             f"scene={render_match['resolved_scene_name']} "
             f"num_input_views={render_match['resolved_num_input_views']} "
-            f"total_frames={total_frames} "
+            f"train_total_frames={total_frames} "
+            f"render_total_frames={render_total_frames} "
             f"available_splits={render_match['resolved_available_num_input_views']}"
         )
+
         if args.l_short is None:
             args.l_short = 576
             print("Match-render mode: defaulting --l_short to 576 to mirror demo rendering.")
