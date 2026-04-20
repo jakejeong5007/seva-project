@@ -238,8 +238,10 @@ class SevaClipDataset(Dataset):
       - input_mask:  [T] bool
       - frame_ids:   [T] frame indices inside the scene
 
-    The dataset reuses the official ReconfusionParser and the per-scene
-    train_test_split_*.json files already written during parsing.
+    The dataset reuses the official ReconfusionParser. By default it samples
+    paper-style random T-frame clips and chooses M input views uniformly from
+    1..T-1. For render-matching or benchmark checks, set
+    training_sample_mode="benchmark_split" to reuse train_test_split_*.json.
     """
 
     def __init__(
@@ -254,6 +256,9 @@ class SevaClipDataset(Dataset):
         normalize_intrinsics: bool = True,
         shuffle_test_frames: bool = True,
         frame_selection_mode: Literal["clip", "img2trajvid"] = "clip",
+        training_sample_mode: Literal["paper", "benchmark_split"] = "paper",
+        small_stride_prob: float = 0.2,
+        clips_per_scene_per_epoch: int = 16,
         scene_names: Optional[Sequence[str]] = None,
         parser_cache_size: int = 16,
         seed: int = 42,
@@ -285,13 +290,30 @@ class SevaClipDataset(Dataset):
         self.normalize_intrinsics = normalize_intrinsics
         self.shuffle_test_frames = shuffle_test_frames
         self.frame_selection_mode = frame_selection_mode
+        if training_sample_mode not in {"paper", "benchmark_split"}:
+            raise ValueError(
+                "training_sample_mode must be either 'paper' or 'benchmark_split', "
+                f"got {training_sample_mode!r}."
+            )
+        if training_sample_mode == "paper" and self.total_frames is None:
+            raise ValueError("training_sample_mode='paper' requires total_frames to be set.")
+        self.training_sample_mode = training_sample_mode
+        self.small_stride_prob = float(small_stride_prob)
+        if not (0.0 <= self.small_stride_prob <= 1.0):
+            raise ValueError(f"small_stride_prob must be in [0, 1], got {small_stride_prob}")
+        self.clips_per_scene_per_epoch = max(int(clips_per_scene_per_epoch), 1)
+        self.epoch = 0
         self.parser_cache_size = max(int(parser_cache_size), 0)
         self.seed = int(seed)
         self._parser_cache: Dict[str, ReconfusionParser] = {}
         self._parser_cache_order: List[str] = []
 
     def __len__(self) -> int:
-        return len(self.scene_dirs)
+        return len(self.scene_dirs) * self.clips_per_scene_per_epoch
+
+    def set_epoch(self, epoch: int) -> None:
+        """Update the epoch seed so each scene yields fresh sampled clips."""
+        self.epoch = int(epoch)
 
     def _get_parser(self, scene_dir: Path) -> ReconfusionParser:
         key = str(scene_dir.resolve())
@@ -310,7 +332,7 @@ class SevaClipDataset(Dataset):
         return parser
 
     def _make_rng(self, idx: int) -> random.Random:
-        return random.Random(self.seed + idx)
+        return random.Random(self.seed + self.epoch * 1_000_003 + idx)
 
     def _choose_num_inputs(
         self,
@@ -386,6 +408,56 @@ class SevaClipDataset(Dataset):
 
         return all_ids, input_ids, selected_test_ids, input_mask
 
+    def _select_frame_ids_paper(
+        self,
+        parser: ReconfusionParser,
+        rng: random.Random,
+    ) -> Tuple[List[int], List[int], List[int], List[bool]]:
+        """Sample a paper-style T-frame context and random input/target split.
+
+        The SEVA paper samples a context window T=M+N, chooses M uniformly from
+        1..T-1, and includes a small-stride branch with probability 0.2.
+        """
+        if self.total_frames is None:
+            raise ValueError("paper sampling requires total_frames to be set.")
+
+        T = int(self.total_frames)
+        if T < 2:
+            raise ValueError(f"paper sampling requires total_frames >= 2, got {T}.")
+        all_ids = list(range(len(parser.image_paths)))
+        if len(all_ids) < T:
+            raise ValueError(f"Scene has only {len(all_ids)} frames, need T={T}.")
+
+        if rng.random() < self.small_stride_prob:
+            max_stride = max(1, (len(all_ids) - 1) // max(T - 1, 1))
+            # Keep the stride small to bias this branch toward nearby views.
+            stride = rng.randint(1, min(2, max_stride))
+            max_start = len(all_ids) - 1 - stride * (T - 1)
+            start = rng.randint(0, max_start)
+            frame_ids = [all_ids[start + i * stride] for i in range(T)]
+        else:
+            frame_ids = sorted(rng.sample(all_ids, k=T))
+
+        num_inputs = rng.randint(1, T - 1)
+        input_positions = set(rng.sample(range(T), k=num_inputs))
+        input_mask = [i in input_positions for i in range(T)]
+
+        input_ids = [frame_id for i, frame_id in enumerate(frame_ids) if input_mask[i]]
+        target_ids = [frame_id for i, frame_id in enumerate(frame_ids) if not input_mask[i]]
+        return frame_ids, input_ids, target_ids, input_mask
+
+    def _load_all_c2ws(self, parser: ReconfusionParser) -> torch.Tensor:
+        all_ids = list(range(len(parser.image_paths)))
+        return torch.stack(
+            [
+                torch.from_numpy(
+                    np.asarray(parser.camtoworlds[frame_id], dtype=np.float32)
+                )
+                for frame_id in all_ids
+            ],
+            dim=0,
+        )
+
     def _load_clip(
         self,
         parser: ReconfusionParser,
@@ -419,22 +491,30 @@ class SevaClipDataset(Dataset):
         )
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        scene_dir = self.scene_dirs[idx]
+        scene_dir = self.scene_dirs[idx % len(self.scene_dirs)]
         parser = self._get_parser(scene_dir)
         rng = self._make_rng(idx)
 
-        num_inputs = self._choose_num_inputs(parser, rng)
-        frame_ids, input_ids, target_ids, input_mask = self._select_frame_ids(
-            parser=parser,
-            num_inputs=num_inputs,
-            rng=rng,
-        )
+        if self.training_sample_mode == "paper":
+            frame_ids, input_ids, target_ids, input_mask = self._select_frame_ids_paper(
+                parser=parser,
+                rng=rng,
+            )
+            num_inputs = len(input_ids)
+        else:
+            num_inputs = self._choose_num_inputs(parser, rng)
+            frame_ids, input_ids, target_ids, input_mask = self._select_frame_ids(
+                parser=parser,
+                num_inputs=num_inputs,
+                rng=rng,
+            )
 
         imgs, Ks, c2ws = self._load_clip(
             parser=parser,
             scene_dir=scene_dir,
             frame_ids=frame_ids,
         )
+        all_c2ws = self._load_all_c2ws(parser)
 
         input_mask_tensor = torch.tensor(input_mask, dtype=torch.bool)
         input_indices_tensor = torch.nonzero(input_mask_tensor, as_tuple=False).squeeze(-1)
@@ -446,6 +526,7 @@ class SevaClipDataset(Dataset):
             "imgs": imgs,                                  # [T, 3, H, W]
             "Ks": Ks,                                      # [T, 3, 3]
             "c2ws": c2ws,                                  # [T, 4, 4]
+            "all_c2ws": all_c2ws,                          # [N_scene, 4, 4]
             "input_mask": input_mask_tensor,               # [T]
             "input_indices": input_indices_tensor,         # [M]
             "target_indices": target_indices_tensor,       # [N]
@@ -476,6 +557,8 @@ def seva_clip_collate(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "imgs": torch.stack([item["imgs"] for item in batch], dim=0),
         "Ks": torch.stack([item["Ks"] for item in batch], dim=0),
         "c2ws": torch.stack([item["c2ws"] for item in batch], dim=0),
+        # Keep all scene cameras as a list because scenes can have different lengths.
+        "all_c2ws": [item["all_c2ws"] for item in batch],
         "input_mask": torch.stack([item["input_mask"] for item in batch], dim=0),
         "frame_ids": torch.stack([item["frame_ids"] for item in batch], dim=0),
         "num_input_views": torch.tensor(

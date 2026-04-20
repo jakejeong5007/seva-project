@@ -103,7 +103,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--total_frames", type=int, default=8)
-    parser.add_argument("--num_input_views", type=str, default="1")
+    parser.add_argument("--num_input_views", type=str, default="1,6")
+    parser.add_argument(
+        "--training_sample_mode",
+        type=str,
+        default="paper",
+        choices=["paper", "benchmark_split"],
+        help=(
+            "paper samples random T-frame contexts and random M input views. "
+            "benchmark_split reuses train_test_split_*.json for render matching."
+        ),
+    )
+    parser.add_argument("--small_stride_prob", type=float, default=0.2)
+    parser.add_argument("--clips_per_scene_per_epoch", type=int, default=16)
     parser.add_argument("--height", type=int, default=576)
     parser.add_argument("--width", type=int, default=576)
     parser.add_argument(
@@ -152,8 +164,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--schedule",
         type=str,
-        default="cosine_vp",
-        choices=["cosine_vp", "rf_linear"],
+        default="seva_ddpm",
+        choices=["seva_ddpm", "cosine_vp", "rf_linear"],
     )
     parser.add_argument(
         "--objective",
@@ -248,7 +260,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--init_backbone_mode",
         type=str,
-        default="scratch",
+        default="official",
         choices=["scratch", "resume", "official", "local_pretrained"],
         help="How to initialize the SEVA backbone before optimizer creation.",
     )
@@ -396,6 +408,9 @@ def build_dataloader(
     batch_size: int,
     num_workers: int,
     frame_selection_mode: str = "clip",
+    training_sample_mode: str = "paper",
+    small_stride_prob: float = 0.2,
+    clips_per_scene_per_epoch: int = 16,
     scene_names: Optional[tuple[str, ...]] = None,
 ) -> DataLoader:
     dataset = SevaClipDataset(
@@ -409,6 +424,9 @@ def build_dataloader(
         normalize_intrinsics=normalize_intrinsics,
         shuffle_test_frames=True,
         frame_selection_mode=frame_selection_mode,  # type: ignore[arg-type]
+        training_sample_mode=training_sample_mode,  # type: ignore[arg-type]
+        small_stride_prob=small_stride_prob,
+        clips_per_scene_per_epoch=clips_per_scene_per_epoch,
         scene_names=scene_names,
         seed=seed,
     )
@@ -559,6 +577,7 @@ def main() -> None:
 
     dataset_scene_names: Optional[tuple[str, ...]] = None
     frame_selection_mode = "clip"
+    training_sample_mode = args.training_sample_mode
     total_frames = int(args.total_frames)
     if args.match_render_scene is not None:
         render_match = resolve_render_match_overrides(
@@ -570,6 +589,7 @@ def main() -> None:
         )
         dataset_scene_names = render_match["scene_names"]
         frame_selection_mode = render_match["frame_selection_mode"]
+        training_sample_mode = "benchmark_split"
         num_input_views = render_match["num_input_views"]
         total_frames = int(render_match["total_frames"])
         print(
@@ -602,6 +622,9 @@ def main() -> None:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         frame_selection_mode=frame_selection_mode,
+        training_sample_mode=training_sample_mode,
+        small_stride_prob=args.small_stride_prob,
+        clips_per_scene_per_epoch=args.clips_per_scene_per_epoch,
         scene_names=dataset_scene_names,
     )
 
@@ -621,6 +644,9 @@ def main() -> None:
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             frame_selection_mode=frame_selection_mode,
+            training_sample_mode=training_sample_mode,
+            small_stride_prob=args.small_stride_prob,
+            clips_per_scene_per_epoch=args.clips_per_scene_per_epoch,
             scene_names=dataset_scene_names,
         )
     except Exception as exc:
@@ -689,6 +715,7 @@ def main() -> None:
     config_payload["resolved_num_input_views"] = list(num_input_views)
     config_payload["resolved_total_frames"] = total_frames
     config_payload["resolved_frame_selection_mode"] = frame_selection_mode
+    config_payload["resolved_training_sample_mode"] = training_sample_mode
     config_payload["resolved_scene_names"] = (
         list(dataset_scene_names) if dataset_scene_names is not None else None
     )
@@ -724,6 +751,7 @@ def main() -> None:
         sample_posterior=args.sample_posterior,
         camera_scale=args.camera_scale,
         schedule=args.schedule,
+        reference_c2ws_key="all_c2ws",
         objective=args.objective,
         target_frame_weight=args.target_frame_weight,
         input_frame_weight=args.input_frame_weight,
@@ -745,6 +773,8 @@ def main() -> None:
 
     for epoch in range(resume_state.epoch, args.epochs):
         last_epoch = epoch
+        if hasattr(train_loader.dataset, "set_epoch"):
+            train_loader.dataset.set_epoch(epoch)
         if args.overfit_one_batch:
             batch_iterator = enumerate(repeat(overfit_batch))
         else:
@@ -762,6 +792,7 @@ def main() -> None:
                     encoding_t=args.encoding_t,
                     sample_posterior=args.sample_posterior,
                     camera_scale=args.camera_scale,
+                    reference_c2ws_key="all_c2ws",
                     schedule=args.schedule,
                     objective=args.objective,
                     target_frame_weight=args.target_frame_weight,
@@ -771,7 +802,7 @@ def main() -> None:
                     conditioner_no_grad=not bundle.train_conditioner,
                     encoder_no_grad=not bundle.train_ae,
                     autocast_dtype=autocast_dtype,
-                    include_replace_in_conditioning=False,
+                    include_replace_in_conditioning=True,
                 )
 
             loss = loss_out.loss / float(args.grad_accum_steps)
