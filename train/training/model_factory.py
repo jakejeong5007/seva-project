@@ -1,5 +1,4 @@
 # File: model_factory.py
-# Author: OpenAI ChatGPT, 04/14/2026
 # Description: Utilities for instantiating the released SEVA backbone,
 #              optional CLIP image conditioner, and a forward-pass smoke test.
 
