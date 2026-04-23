@@ -514,9 +514,9 @@ def compute_seva_diffusion_loss(
     batch = _ensure_batched_clip_batch(batch)
     
     
+    device_obj = _resolve_device(bundle, device)
+
     if offload_frozen_encoders:
-        # They may have been moved to CPU after the previous backbone forward.
-        # Move them back only for conditioning / VAE encoding.
         if bundle.conditioner is not None:
             bundle.conditioner.to(device_obj)
         if bundle.ae is not None:
