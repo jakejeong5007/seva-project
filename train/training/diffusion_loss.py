@@ -512,7 +512,15 @@ def compute_seva_diffusion_loss(
         )
 
     batch = _ensure_batched_clip_batch(batch)
-    device_obj = _resolve_device(bundle, device)
+    
+    
+    if offload_frozen_encoders:
+        # They may have been moved to CPU after the previous backbone forward.
+        # Move them back only for conditioning / VAE encoding.
+        if bundle.conditioner is not None:
+            bundle.conditioner.to(device_obj)
+        if bundle.ae is not None:
+            bundle.ae.to(device_obj)
 
     imgs = _require_tensor(batch, "imgs").to(device_obj)
     input_mask = _require_tensor(batch, "input_mask").bool().to(device_obj)
@@ -600,9 +608,58 @@ def compute_seva_diffusion_loss(
         c_in = torch.rsqrt(sigma_flat[:, None, None, None].square() + 1.0)
         t_flat = timesteps.flatten(0, 1).to(device=device_obj)
 
+        if offload_frozen_encoders:
+            # After conditioning and latent encoding, the frozen CLIP conditioner
+            # and VAE are no longer needed during the SEVA backbone forward.
+            # Moving them off GPU can free several GB on a 40–48GB card.
+            if bundle.conditioner is not None and not bundle.train_conditioner:
+                bundle.conditioner.to("cpu")
+            if bundle.ae is not None and not bundle.train_ae:
+                bundle.ae.to("cpu")
+
+            gc.collect()
+            if torch.device(device_obj).type == "cuda":
+                torch.cuda.empty_cache()
+
         forward_context = _get_autocast_context(device_obj, autocast_dtype)
+
+        def _run_wrapper_checkpointed(
+            x_in: torch.Tensor,
+            t_in: torch.Tensor,
+            concat: torch.Tensor,
+            crossattn: torch.Tensor,
+            dense_vector: torch.Tensor,
+        ) -> torch.Tensor:
+            return bundle.wrapper(
+                x_in,
+                t_in,
+                c={
+                    "concat": concat,
+                    "crossattn": crossattn,
+                    "dense_vector": dense_vector,
+                },
+                num_frames=T,
+            )
+
         with forward_context:
-            pred = bundle.wrapper(x * c_in, t_flat, c=moved_c, num_frames=T)
+            if use_activation_checkpointing:
+                pred = activation_checkpoint(
+                    _run_wrapper_checkpointed,
+                    x * c_in,
+                    t_flat,
+                    moved_c["concat"],
+                    moved_c["crossattn"],
+                    moved_c["dense_vector"],
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                )
+            else:
+                pred = bundle.wrapper(
+                    x * c_in,
+                    t_flat,
+                    c=moved_c,
+                    num_frames=T,
+                )
 
     else:
         timesteps = sample_timesteps(

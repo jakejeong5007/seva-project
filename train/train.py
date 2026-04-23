@@ -35,6 +35,17 @@ from train.data.clip_dataset import (
     seva_clip_collate,
 )
 from train.training.diffusion_loss import compute_seva_diffusion_loss
+try:
+    from train.training.epipolar_loss import (
+        EpipolarLossConfig,
+        compute_visibility_gated_epipolar_loss,
+        should_apply_epipolar_loss,
+    )
+except Exception:  # pragma: no cover - optional research loss.
+    EpipolarLossConfig = None  # type: ignore[assignment]
+    compute_visibility_gated_epipolar_loss = None  # type: ignore[assignment]
+    should_apply_epipolar_loss = None  # type: ignore[assignment]
+
 from train.training.model_factory import (
     SevaBundle,
     build_seva_bundle,
@@ -112,7 +123,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_split", type=str, default="train")
     parser.add_argument("--val_split", type=str, default="val")
 
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--max_steps", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
@@ -266,6 +277,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--match_render_task",
+        type=str,
+        default="img2vid",
+        choices=["img2vid", "img2trajvid"],
+        help=(
+            "Which inference ordering to mirror in --match_render_scene mode. "
+            "Use img2vid for benchmark-style trajectory evaluation and img2trajvid "
+            "only when you explicitly want input-views-first ordering."
+        ),
+    )
+    parser.add_argument(
         "--match_render_preset",
         type=str,
         default="quality",
@@ -370,13 +392,21 @@ def parse_args() -> argparse.Namespace:
         "--debug_fixed_noise_seed",
         type=int,
         default=None,
-        help="Debug only: fix Gaussian noise sampling for deterministic overfit tests.",
+        help=(
+            "Deprecated no-op in the current checked-in diffusion_loss.py. "
+            "Keep only for backwards CLI compatibility unless diffusion_loss.py "
+            "is extended to accept deterministic-noise debug inputs."
+        ),
     )
     parser.add_argument(
         "--debug_fixed_noise_idx",
         type=int,
         default=None,
-        help="Debug only: fix SEVA/DDPM noise index for deterministic overfit tests.",
+        help=(
+            "Deprecated no-op in the current checked-in diffusion_loss.py. "
+            "Keep only for backwards CLI compatibility unless diffusion_loss.py "
+            "is extended to accept deterministic-noise debug inputs."
+        ),
     )
     parser.add_argument(
         "--activation_checkpointing",
@@ -397,6 +427,35 @@ def parse_args() -> argparse.Namespace:
             "is built, before the trainable SEVA backbone forward."
         ),
     )
+
+    # ------------------------------------------------------------------
+    # Research: visibility-gated epipolar loss
+    # ------------------------------------------------------------------
+    parser.add_argument("--epi_loss_weight", type=float, default=0.0)
+    parser.add_argument("--epi_start_step", type=int, default=1000)
+    parser.add_argument("--epi_warmup_steps", type=int, default=2000)
+    parser.add_argument("--epi_every", type=int, default=2)
+    parser.add_argument("--epi_prediction_type", type=str, default="epsilon", choices=["epsilon", "x0"])
+    parser.add_argument("--epi_target_frames_per_clip", type=int, default=1)
+    parser.add_argument("--epi_sources_per_target", type=int, default=1)
+    parser.add_argument("--epi_res", type=int, default=128)
+    parser.add_argument("--epi_pixels", type=int, default=512)
+    parser.add_argument("--epi_line_samples", type=int, default=32)
+    parser.add_argument("--epi_textured_fraction", type=float, default=0.8)
+    parser.add_argument("--epi_tau", type=float, default=0.07)
+    parser.add_argument("--epi_conf_min", type=float, default=0.10)
+    parser.add_argument("--epi_match_logit_center", type=float, default=0.30)
+    parser.add_argument("--epi_match_logit_scale", type=float, default=0.10)
+    parser.add_argument("--epi_max_sigma", type=float, default=1.0)
+    parser.add_argument("--epi_sigma_softness", type=float, default=0.25)
+    parser.add_argument("--epi_min_epipolar_baseline", type=float, default=1e-4)
+    parser.add_argument("--epi_use_rotation_h_fallback", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--epi_min_rotation_for_h_deg", type=float, default=2.0)
+    parser.add_argument("--epi_min_valid_ratio", type=float, default=0.15)
+    parser.add_argument("--epi_feature_mode", type=str, default="rgb_sobel", choices=["rgb_sobel"])
+    parser.add_argument("--epi_ae_decode_chunk_size", type=int, default=1)
+    parser.add_argument("--epi_auto_move_ae_to_device", action=argparse.BooleanOptionalAction, default=True)
+
     return parser.parse_args()
 
 
@@ -560,6 +619,7 @@ def resolve_render_match_overrides(
     scene_name: str,
     preset: str,
     requested_num_inputs: Optional[int],
+    task: str = "img2vid",
 ) -> dict[str, Any]:
     scene_dir = find_scene_dir(dataset_root, scene_name, split=split)
     metadata_default = inspect_scene_split(scene_dir)
@@ -572,13 +632,15 @@ def resolve_render_match_overrides(
     metadata = inspect_scene_split(scene_dir, num_input_views=selected_num_inputs)
     return {
         "scene_names": (scene_name,),
-        "frame_selection_mode": "img2trajvid",
+        # img2vid keeps trajectory order; img2trajvid reorders inputs-first.
+        "frame_selection_mode": "img2trajvid" if task == "img2trajvid" else "clip",
         "num_input_views": (selected_num_inputs,),
         "total_frames": metadata["num_total_frames"],
         "resolved_scene_dir": scene_dir,
         "resolved_scene_name": scene_name,
         "resolved_num_input_views": selected_num_inputs,
         "resolved_available_num_input_views": available,
+        "resolved_task": task,
     }
 
 
@@ -601,6 +663,44 @@ def resolve_learning_rate(user_lr: Optional[float], init_mode: str) -> float:
     if init_mode in {"official", "local_pretrained"}:
         return DEFAULT_FINETUNE_LR
     return DEFAULT_SCRATCH_LR
+
+
+def build_epipolar_config_from_args(args: argparse.Namespace) -> Optional[Any]:
+    if float(args.epi_loss_weight) <= 0.0:
+        return None
+    if EpipolarLossConfig is None:
+        raise RuntimeError(
+            "--epi_loss_weight was set, but train.training.epipolar_loss could not be imported."
+        )
+    return EpipolarLossConfig(
+        loss_weight=float(args.epi_loss_weight),
+        start_step=int(args.epi_start_step),
+        warmup_steps=int(args.epi_warmup_steps),
+        every=int(args.epi_every),
+        prediction_type=str(args.epi_prediction_type),
+        target_frames_per_clip=int(args.epi_target_frames_per_clip),
+        sources_per_target=int(args.epi_sources_per_target),
+        feature_res=int(args.epi_res),
+        pixels_per_pair=int(args.epi_pixels),
+        line_samples=int(args.epi_line_samples),
+        textured_fraction=float(args.epi_textured_fraction),
+        tau=float(args.epi_tau),
+        confidence_min=float(args.epi_conf_min),
+        match_logit_center=float(args.epi_match_logit_center),
+        match_logit_scale=float(args.epi_match_logit_scale),
+        max_sigma=float(args.epi_max_sigma),
+        sigma_softness=float(args.epi_sigma_softness),
+        min_epipolar_baseline=float(args.epi_min_epipolar_baseline),
+        use_rotation_h_fallback=bool(args.epi_use_rotation_h_fallback),
+        min_rotation_for_h_deg=float(args.epi_min_rotation_for_h_deg),
+        min_valid_ratio=float(args.epi_min_valid_ratio),
+        feature_mode=str(args.epi_feature_mode),
+        ae_decode_chunk_size=(
+            None if args.epi_ae_decode_chunk_size is None or int(args.epi_ae_decode_chunk_size) <= 0
+            else int(args.epi_ae_decode_chunk_size)
+        ),
+        auto_move_ae_to_device=bool(args.epi_auto_move_ae_to_device),
+    )
 
 
 def get_optimizer_learning_rates(optimizer: torch.optim.Optimizer) -> list[float]:
@@ -780,6 +880,8 @@ def build_optimizer_from_bundle(
         betas=betas,
         eps=eps,
         weight_decay=weight_decay,
+        foreach=False,
+        fused=False,
     )
 
 
@@ -916,6 +1018,21 @@ def main() -> None:
         main_print("Overfit-one-batch mode active; forcing log_every=1.")
         args.log_every = 1
 
+    if args.debug_fixed_noise_seed is not None or args.debug_fixed_noise_idx is not None:
+        main_print(
+            "Warning: --debug_fixed_noise_seed / --debug_fixed_noise_idx are currently "
+            "no-op compatibility flags in the checked-in diffusion_loss.py. "
+            "They will not make training deterministic unless diffusion_loss.py "
+            "is extended to accept them."
+        )
+
+    if args.l_short is None and args.height == args.width:
+        main_print(
+            "Note: current clip_dataset.py uses direct resize to HxW, not official "
+            "resize-cover + center-crop. For benchmark-aligned training, keep eval "
+            "preprocessing matched or patch clip_dataset.py with a true center-crop mode."
+        )
+
     device = resolve_device_for_process(args, dist_ctx)
     enable_sdpa_backends_for_cuda()
 
@@ -930,6 +1047,7 @@ def main() -> None:
             scene_name=args.match_render_scene,
             preset=args.match_render_preset,
             requested_num_inputs=args.match_render_num_inputs,
+            task=args.match_render_task,
         )
         dataset_scene_names = render_match["scene_names"]
         frame_selection_mode = render_match["frame_selection_mode"]
@@ -959,9 +1077,12 @@ def main() -> None:
             f"render_total_frames={render_total_frames} "
             f"available_splits={render_match['resolved_available_num_input_views']}"
         )
-        if args.l_short is None:
+        if args.match_render_task == "img2trajvid" and args.l_short is None:
             args.l_short = 576
-            main_print("Match-render mode: defaulting --l_short to 576 to mirror demo rendering.")
+            main_print(
+                "Match-render mode: defaulting --l_short to 576 because "
+                "--match_render_task img2trajvid usually uses shortest-side resize."
+            )
 
     run_dir = args.output_dir / args.run_name
     checkpoint_dir = run_dir / "checkpoints"
@@ -1154,6 +1275,7 @@ def main() -> None:
         val_batches=args.val_batches,
         autocast_dtype=autocast_dtype,
     )
+    epi_config = build_epipolar_config_from_args(args)
 
     trainable_parameters = collect_trainable_parameters(bundle)
     if not trainable_parameters:
@@ -1204,7 +1326,25 @@ def main() -> None:
                     offload_frozen_encoders=args.offload_frozen_encoders,
                 )
 
-            loss = loss_out.loss / float(args.grad_accum_steps)
+            epi_out = None
+            total_loss = loss_out.loss
+            if epi_config is not None:
+                if should_apply_epipolar_loss is None or compute_visibility_gated_epipolar_loss is None:
+                    raise RuntimeError(
+                        "Epipolar loss was requested, but train.training.epipolar_loss "
+                        "could not be imported."
+                    )
+                if should_apply_epipolar_loss(global_step, epi_config):
+                    epi_out = compute_visibility_gated_epipolar_loss(
+                        bundle=bundle,
+                        batch=batch,
+                        loss_out=loss_out,
+                        config=epi_config,
+                        global_step=global_step,
+                    )
+                    total_loss = total_loss + epi_out.loss
+
+            loss = total_loss / float(args.grad_accum_steps)
             will_step_after_backward = accum_counter + 1 >= args.grad_accum_steps
             with maybe_no_sync_context(bundle.wrapper, should_sync=will_step_after_backward):
                 loss.backward()
@@ -1239,7 +1379,8 @@ def main() -> None:
                     "epoch": epoch,
                     "batch_idx": batch_idx,
                     "global_step": global_step,
-                    "loss": loss_out.loss.detach().float().item(),
+                    "loss": total_loss.detach().float().item(),
+                    "loss_diffusion": loss_out.loss.detach().float().item(),
                     "mse_mean": loss_out.mse_per_item.detach().float().mean().item(),
                     "weights_mean": loss_out.weights.detach().float().mean().item(),
                     "lr": float(optimizer.param_groups[0]["lr"]),
@@ -1254,6 +1395,21 @@ def main() -> None:
                 }
                 if "scene_name" in batch:
                     record["scene_name"] = batch["scene_name"]
+                if epi_out is not None:
+                    record["loss_epipolar"] = epi_out.loss.detach().float().item()
+                    record["epi_raw_loss"] = epi_out.raw_loss.detach().float().item()
+                    record["epi_warmup_factor"] = float(epi_out.warmup_factor)
+                    record["epi_mean_sigma_gate"] = epi_out.mean_sigma_gate.detach().float().item()
+                    record["epi_mean_confidence"] = epi_out.mean_confidence.detach().float().item()
+                    record["epi_mean_valid_ratio"] = epi_out.mean_valid_ratio.detach().float().item()
+                    record["epi_mean_baseline"] = epi_out.mean_baseline.detach().float().item()
+                    record["epi_mean_rotation_deg"] = epi_out.mean_rotation_deg.detach().float().item()
+                    record["epi_num_pairs"] = int(epi_out.num_pairs)
+                    record["epi_num_target_frames"] = int(epi_out.num_target_frames)
+                    record["epi_num_pixels"] = int(epi_out.num_pixels)
+                    record["epi_num_epipolar_pairs"] = int(epi_out.num_epipolar_pairs)
+                    record["epi_num_homography_pairs"] = int(epi_out.num_homography_pairs)
+                    record["epi_num_skipped_pairs"] = int(epi_out.num_skipped_pairs)
                 if grad_norm_value is not None:
                     record["grad_norm"] = grad_norm_value
                 if device.type == "cuda":
@@ -1265,9 +1421,14 @@ def main() -> None:
                     )
                 append_jsonl(log_path, record)
                 elapsed_minutes = (time.time() - train_start_time) / 60.0
+                epi_fragment = (
+                    f" epi={record['loss_epipolar']:.6f}"
+                    if "loss_epipolar" in record
+                    else ""
+                )
                 print(
                     f"step={global_step:06d} epoch={epoch:03d} batch={batch_idx:05d} "
-                    f"loss={record['loss']:.6f} lr={record['lr']:.2e} "
+                    f"loss={record['loss']:.6f}{epi_fragment} lr={record['lr']:.2e} "
                     f"iter={iter_time:.2f}s elapsed={elapsed_minutes:.1f}m"
                 )
 
