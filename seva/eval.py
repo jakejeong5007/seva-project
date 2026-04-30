@@ -767,12 +767,410 @@ def select_pose_arc_prior_indices(
     return np.asarray(sorted(selected), dtype=np.int64)
 
 
+def _option_bool(value, default=False):
+    """Parse Fire/CLI bool-like values robustly."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in {"1", "true", "yes", "y", "on"}:
+            return True
+        if value in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
+def _option_optional_int(value, default=None):
+    """Parse optional int values from Fire/CLI."""
+    if value is None:
+        return default
+    if isinstance(value, str) and value.strip().lower() in {"none", "null", ""}:
+        return default
+    return int(value)
+
+
+def _to_numpy_c2ws_44(c2ws):
+    """
+    Convert c2ws to numpy [N, 4, 4].
+
+    SEVA often passes c2ws as [N, 3, 4]. This restores the homogeneous row.
+    """
+    if isinstance(c2ws, torch.Tensor):
+        arr = c2ws.detach().cpu().numpy()
+    else:
+        arr = np.asarray(c2ws)
+
+    if arr.ndim != 3:
+        raise ValueError(f"Expected c2ws [N,3,4] or [N,4,4], got {arr.shape}")
+
+    if arr.shape[1:] == (4, 4):
+        return arr.astype(np.float64)
+
+    if arr.shape[1:] == (3, 4):
+        bottom = np.zeros((arr.shape[0], 1, 4), dtype=arr.dtype)
+        bottom[:, 0, 3] = 1.0
+        return np.concatenate([arr, bottom], axis=1).astype(np.float64)
+
+    raise ValueError(f"Expected c2ws [N,3,4] or [N,4,4], got {arr.shape}")
+
+
+def _rotation_angle_deg(R_rel):
+    """
+    Rotation angle from a 3x3 relative rotation matrix.
+
+    This accounts for arbitrary 3D rotation, including yaw, pitch, and roll.
+    """
+    cos_theta = (np.trace(R_rel) - 1.0) * 0.5
+    cos_theta = float(np.clip(cos_theta, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cos_theta)))
+
+
+def _candidate_indices_from_inputs(num_frames, input_frame_indices):
+    """Return ordered candidate target/prior indices, excluding GT input frames."""
+    input_set = set(int(x) for x in input_frame_indices)
+    return np.asarray(
+        [i for i in range(int(num_frames)) if i not in input_set],
+        dtype=np.int64,
+    )
+
+
+def _uniform_prior_indices(c2ws, num_prior_frames, input_frame_indices):
+    """
+    Original SEVA-style uniform frame-index anchor selection.
+
+    This is kept as the baseline/fallback.
+    """
+    c2ws_np = _to_numpy_c2ws_44(c2ws)
+    candidate_indices = _candidate_indices_from_inputs(
+        c2ws_np.shape[0],
+        input_frame_indices,
+    )
+
+    if candidate_indices.size == 0:
+        return candidate_indices
+
+    num_prior_frames = int(num_prior_frames)
+
+    if num_prior_frames <= 0:
+        return np.asarray([], dtype=np.int64)
+
+    if num_prior_frames >= candidate_indices.size:
+        return candidate_indices
+
+    positions = np.ceil(
+        np.linspace(
+            0,
+            candidate_indices.shape[0] - 1,
+            num_prior_frames,
+            endpoint=True,
+        )
+    ).astype(np.int64)
+
+    return candidate_indices[positions]
+
+
+def _motion_steps_for_ordered_candidates(
+    c2ws_44,
+    candidate_indices,
+    *,
+    trans_weight=1.0,
+    rot_weight=1.0,
+    rot_ref_deg=10.0,
+):
+    """
+    Compute camera-motion arc length between consecutive candidate frames.
+
+    Each step combines:
+      - normalized translation distance
+      - normalized full 3D relative rotation angle
+
+    Translation is normalized by median nonzero consecutive translation for
+    scene-scale robustness. Rotation is normalized by rot_ref_deg.
+    """
+    if len(candidate_indices) <= 1:
+        return np.zeros((0,), dtype=np.float64)
+
+    poses = c2ws_44[candidate_indices]
+    centers = poses[:, :3, 3]
+    rotations = poses[:, :3, :3]
+
+    trans = np.linalg.norm(centers[1:] - centers[:-1], axis=1)
+    positive = trans[trans > 1e-8]
+
+    if positive.size > 0:
+        trans_scale = float(np.median(positive))
+    else:
+        span = np.linalg.norm(centers.max(axis=0) - centers.min(axis=0))
+        trans_scale = max(float(span), 1.0)
+
+    trans_norm = trans / max(trans_scale, 1e-8)
+
+    rot_deg = []
+    for i in range(len(rotations) - 1):
+        R_rel = rotations[i].T @ rotations[i + 1]
+        rot_deg.append(_rotation_angle_deg(R_rel))
+    rot_deg = np.asarray(rot_deg, dtype=np.float64)
+    rot_norm = rot_deg / max(float(rot_ref_deg), 1e-8)
+
+    steps = np.sqrt(
+        (float(trans_weight) * trans_norm) ** 2
+        + (float(rot_weight) * rot_norm) ** 2
+    )
+
+    return steps.astype(np.float64)
+
+
+def _fill_unique_by_arc_distance(selected, candidate_indices, cumulative, desired_count):
+    """
+    If two desired arc-length positions pick the same frame, fill missing anchors
+    by choosing candidates farthest from already selected anchors in cumulative
+    camera-motion space.
+    """
+    selected_set = set(int(x) for x in selected)
+    candidate_to_pos = {int(idx): i for i, idx in enumerate(candidate_indices.tolist())}
+
+    while len(selected_set) < desired_count and len(selected_set) < len(candidate_indices):
+        selected_positions = np.asarray(
+            [cumulative[candidate_to_pos[idx]] for idx in selected_set],
+            dtype=np.float64,
+        )
+
+        if selected_positions.size == 0:
+            selected_set.add(int(candidate_indices[0]))
+            continue
+
+        dist_to_selected = np.min(
+            np.abs(cumulative[:, None] - selected_positions[None, :]),
+            axis=1,
+        )
+
+        for idx in selected_set:
+            pos = candidate_to_pos.get(int(idx), None)
+            if pos is not None:
+                dist_to_selected[pos] = -1.0
+
+        selected_set.add(int(candidate_indices[int(np.argmax(dist_to_selected))]))
+
+    return sorted(selected_set)
+
+
+def _enforce_max_target_gap_allow_extra(
+    selected,
+    candidate_indices,
+    *,
+    max_targets_between,
+    verbose=False,
+):
+    """
+    Ensure every second-pass interp chunk has at most max_targets_between target
+    frames between adjacent anchors.
+
+    This fixes the assertion:
+        #target frames during each forward in the second pass will not exceed T-2
+
+    For T=21, use max_targets_between=19.
+
+    Unlike the earlier exact-count repair, this function ALLOWS EXTRA ANCHORS.
+    That is necessary because pose-adaptive anchor placement can otherwise leave
+    long low-motion intervals that are invalid for SEVA's second pass.
+    """
+    candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
+    if candidate_indices.size == 0:
+        return np.asarray([], dtype=np.int64)
+
+    if max_targets_between is None:
+        return np.asarray(sorted(set(int(x) for x in selected)), dtype=np.int64)
+
+    max_targets_between = int(max_targets_between)
+    if max_targets_between <= 0:
+        return np.asarray(sorted(set(int(x) for x in selected)), dtype=np.int64)
+
+    # Position in the ordered non-input sequence. This is the order used by
+    # interp chunking to count targets between anchors.
+    index_to_pos = {int(idx): pos for pos, idx in enumerate(candidate_indices.tolist())}
+
+    selected_set = set(int(x) for x in selected if int(x) in index_to_pos)
+
+    # Always include first/last non-input candidate so beginning/end are bounded.
+    selected_set.add(int(candidate_indices[0]))
+    selected_set.add(int(candidate_indices[-1]))
+
+    def ordered_selected():
+        return sorted(selected_set, key=lambda idx: index_to_pos[int(idx)])
+
+    def worst_gap_info():
+        ordered = ordered_selected()
+        if len(ordered) <= 1:
+            return 0, None, None
+
+        worst_count = -1
+        worst_a = None
+        worst_b = None
+
+        for a, b in zip(ordered[:-1], ordered[1:]):
+            pos_a = index_to_pos[int(a)]
+            pos_b = index_to_pos[int(b)]
+
+            # Number of target frames strictly between anchor a and anchor b.
+            count_between = max(0, pos_b - pos_a - 1)
+
+            if count_between > worst_count:
+                worst_count = count_between
+                worst_a = int(a)
+                worst_b = int(b)
+
+        return int(worst_count), worst_a, worst_b
+
+    inserted = 0
+
+    while True:
+        worst_count, a, b = worst_gap_info()
+
+        if worst_count <= max_targets_between:
+            break
+
+        pos_a = index_to_pos[int(a)]
+        pos_b = index_to_pos[int(b)]
+
+        if pos_b <= pos_a + 1:
+            break
+
+        # Insert one anchor near the midpoint of the worst interval.
+        mid_pos = int(round((pos_a + pos_b) * 0.5))
+        mid_pos = max(pos_a + 1, min(pos_b - 1, mid_pos))
+        new_anchor = int(candidate_indices[mid_pos])
+
+        if new_anchor in selected_set:
+            interval_positions = list(range(pos_a + 1, pos_b))
+            unselected = [
+                p
+                for p in interval_positions
+                if int(candidate_indices[p]) not in selected_set
+            ]
+            if not unselected:
+                break
+
+            midpoint = 0.5 * (pos_a + pos_b)
+            mid_pos = min(unselected, key=lambda p: abs(p - midpoint))
+            new_anchor = int(candidate_indices[mid_pos])
+
+        selected_set.add(new_anchor)
+        inserted += 1
+
+    final = np.asarray(ordered_selected(), dtype=np.int64)
+
+    if verbose:
+        final_worst, _, _ = worst_gap_info()
+        print(
+            "[anchor_gap_repair] "
+            f"inserted={inserted} "
+            f"final_num_anchors={len(final)} "
+            f"max_targets_between={final_worst} "
+            f"limit={max_targets_between} "
+            f"indices={final.tolist()}"
+        )
+
+    return final
+
+
+def select_pose_arc_prior_indices(
+    c2ws,
+    num_prior_frames,
+    input_frame_indices,
+    *,
+    trans_weight=1.0,
+    rot_weight=1.0,
+    rot_ref_deg=10.0,
+):
+    """
+    Select prior/anchor frames by cumulative camera motion instead of uniform
+    frame index.
+
+    This returns the requested number of anchors. The max-gap repair is applied
+    later in infer_prior_inds(), where extra anchors may be inserted if needed.
+    """
+    c2ws_44 = _to_numpy_c2ws_44(c2ws)
+    candidate_indices = _candidate_indices_from_inputs(
+        c2ws_44.shape[0],
+        input_frame_indices,
+    )
+
+    desired_count = int(num_prior_frames)
+
+    if candidate_indices.size == 0:
+        return candidate_indices
+
+    if desired_count <= 0:
+        return np.asarray([], dtype=np.int64)
+
+    if desired_count >= candidate_indices.size:
+        return candidate_indices
+
+    steps = _motion_steps_for_ordered_candidates(
+        c2ws_44,
+        candidate_indices,
+        trans_weight=trans_weight,
+        rot_weight=rot_weight,
+        rot_ref_deg=rot_ref_deg,
+    )
+
+    cumulative = np.concatenate([[0.0], np.cumsum(steps)], axis=0)
+
+    if cumulative[-1] <= 1e-8:
+        # Degenerate camera path; fall back to baseline behavior.
+        return _uniform_prior_indices(c2ws, desired_count, input_frame_indices)
+
+    desired_arc = np.linspace(0.0, cumulative[-1], desired_count, endpoint=True)
+
+    selected = []
+    for d in desired_arc:
+        pos = int(np.argmin(np.abs(cumulative - d)))
+        selected.append(int(candidate_indices[pos]))
+
+    selected = _fill_unique_by_arc_distance(
+        selected,
+        candidate_indices,
+        cumulative,
+        desired_count=desired_count,
+    )
+
+    if len(selected) != desired_count:
+        print(
+            "[pose_arc warning] Selected anchor count mismatch: "
+            f"{len(selected)} vs desired {desired_count}. Falling back to uniform."
+        )
+        return _uniform_prior_indices(c2ws, desired_count, input_frame_indices)
+
+    return np.asarray(sorted(selected), dtype=np.int64)
+
+
 def infer_prior_inds(
     c2ws,
     num_prior_frames,
     input_frame_indices,
     options,
 ):
+    """
+    Infer first-pass prior/anchor frame indices.
+
+    New options for interp chunking:
+      prior_selection:
+        "uniform_index"  -> original SEVA behavior
+        "pose_arc"       -> camera-motion arc-length anchors
+
+      pose_anchor_trans_weight: float, default 1.0
+      pose_anchor_rot_weight: float, default 1.0
+      pose_anchor_rot_ref_deg: float, default 10.0
+      pose_anchor_max_gap: optional int
+        If set, insert extra anchors until each adjacent anchor pair has at
+        most this many target frames between them. Use 19 when second-pass T=21.
+      pose_anchor_verbose: bool
+        Print anchor indices and gap-repair diagnostics.
+    """
     chunk_strategy = options.get("chunk_strategy", "nearest")
 
     if chunk_strategy.startswith("interp"):
@@ -793,10 +1191,6 @@ def infer_prior_inds(
                 trans_weight=float(options.get("pose_anchor_trans_weight", 1.0)),
                 rot_weight=float(options.get("pose_anchor_rot_weight", 1.0)),
                 rot_ref_deg=float(options.get("pose_anchor_rot_ref_deg", 10.0)),
-                max_gap_frames=_option_optional_int(
-                    options.get("pose_anchor_max_gap", None),
-                    default=None,
-                ),
             )
 
         else:
@@ -805,14 +1199,39 @@ def infer_prior_inds(
                 "Use 'uniform_index' or 'pose_arc'."
             )
 
+        # Generic repair for SEVA interp second pass. This is deliberately
+        # applied after either uniform or pose_arc if pose_anchor_max_gap is set.
+        max_targets_between = _option_optional_int(
+            options.get("pose_anchor_max_gap", None),
+            default=None,
+        )
+
+        if max_targets_between is not None:
+            c2ws_44 = _to_numpy_c2ws_44(c2ws)
+            candidate_indices = _candidate_indices_from_inputs(
+                c2ws_44.shape[0],
+                input_frame_indices,
+            )
+            prior_frame_indices = _enforce_max_target_gap_allow_extra(
+                prior_frame_indices,
+                candidate_indices,
+                max_targets_between=max_targets_between,
+                verbose=_option_bool(
+                    options.get("pose_anchor_verbose", False),
+                    default=False,
+                ),
+            )
+
         if _option_bool(options.get("pose_anchor_verbose", False), default=False):
             print(
                 f"[prior_selection={prior_selection}] "
-                f"num_prior_frames={num_prior_frames} "
+                f"requested_num_prior_frames={num_prior_frames} "
+                f"actual_num_prior_frames={len(prior_frame_indices)} "
                 f"indices={np.asarray(prior_frame_indices).tolist()}"
             )
 
     else:
+        # Original non-interp behavior.
         prior_frame_indices = []
         while len(prior_frame_indices) < num_prior_frames:
             closest_distance = np.abs(
