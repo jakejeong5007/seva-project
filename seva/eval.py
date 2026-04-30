@@ -745,7 +745,7 @@ def _repair_raw_frame_gaps_allow_extra(
         worst_b = None
 
         for a, b in zip(ordered[:-1], ordered[1:]):
-            count_between = max(0, int(b) - int(a) - 1)
+            count_between = max(0, int(b) - int(a))
             if count_between > worst_count:
                 worst_count = int(count_between)
                 worst_a = int(a)
