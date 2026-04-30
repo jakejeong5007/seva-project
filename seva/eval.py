@@ -612,125 +612,6 @@ def _fill_unique_by_arc_distance(selected, candidate_indices, cumulative, desire
     return sorted(selected_set)
 
 
-def _enforce_max_target_gap_allow_extra(
-    selected,
-    candidate_indices,
-    *,
-    max_targets_between,
-    verbose=False,
-):
-    """
-    Ensure every second-pass interp chunk has at most max_targets_between target
-    frames between adjacent anchors.
-
-    This fixes the assertion:
-        #target frames during each forward in the second pass will not exceed T-2
-
-    For T=21, use max_targets_between=19.
-
-    Unlike the earlier exact-count repair, this function ALLOWS EXTRA ANCHORS.
-    That is necessary because pose-adaptive anchor placement can otherwise leave
-    long low-motion intervals that are invalid for SEVA's second pass.
-    """
-    candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
-    if candidate_indices.size == 0:
-        return np.asarray([], dtype=np.int64)
-
-    if max_targets_between is None:
-        return np.asarray(sorted(set(int(x) for x in selected)), dtype=np.int64)
-
-    max_targets_between = int(max_targets_between)
-    if max_targets_between <= 0:
-        return np.asarray(sorted(set(int(x) for x in selected)), dtype=np.int64)
-
-    # Position in the ordered non-input sequence. This is the order used by
-    # interp chunking to count targets between anchors.
-    index_to_pos = {int(idx): pos for pos, idx in enumerate(candidate_indices.tolist())}
-
-    selected_set = set(int(x) for x in selected if int(x) in index_to_pos)
-
-    # Always include first/last non-input candidate so beginning/end are bounded.
-    selected_set.add(int(candidate_indices[0]))
-    selected_set.add(int(candidate_indices[-1]))
-
-    def ordered_selected():
-        return sorted(selected_set, key=lambda idx: index_to_pos[int(idx)])
-
-    def worst_gap_info():
-        ordered = ordered_selected()
-        if len(ordered) <= 1:
-            return 0, None, None
-
-        worst_count = -1
-        worst_a = None
-        worst_b = None
-
-        for a, b in zip(ordered[:-1], ordered[1:]):
-            pos_a = index_to_pos[int(a)]
-            pos_b = index_to_pos[int(b)]
-
-            # Number of target frames strictly between anchor a and anchor b.
-            count_between = max(0, pos_b - pos_a - 1)
-
-            if count_between > worst_count:
-                worst_count = count_between
-                worst_a = int(a)
-                worst_b = int(b)
-
-        return int(worst_count), worst_a, worst_b
-
-    inserted = 0
-
-    while True:
-        worst_count, a, b = worst_gap_info()
-
-        if worst_count <= max_targets_between:
-            break
-
-        pos_a = index_to_pos[int(a)]
-        pos_b = index_to_pos[int(b)]
-
-        if pos_b <= pos_a + 1:
-            break
-
-        # Insert one anchor near the midpoint of the worst interval.
-        mid_pos = int(round((pos_a + pos_b) * 0.5))
-        mid_pos = max(pos_a + 1, min(pos_b - 1, mid_pos))
-        new_anchor = int(candidate_indices[mid_pos])
-
-        if new_anchor in selected_set:
-            interval_positions = list(range(pos_a + 1, pos_b))
-            unselected = [
-                p
-                for p in interval_positions
-                if int(candidate_indices[p]) not in selected_set
-            ]
-            if not unselected:
-                break
-
-            midpoint = 0.5 * (pos_a + pos_b)
-            mid_pos = min(unselected, key=lambda p: abs(p - midpoint))
-            new_anchor = int(candidate_indices[mid_pos])
-
-        selected_set.add(new_anchor)
-        inserted += 1
-
-    final = np.asarray(ordered_selected(), dtype=np.int64)
-
-    if verbose:
-        final_worst, _, _ = worst_gap_info()
-        print(
-            "[anchor_gap_repair] "
-            f"inserted={inserted} "
-            f"final_num_anchors={len(final)} "
-            f"max_targets_between={final_worst} "
-            f"limit={max_targets_between} "
-            f"indices={final.tolist()}"
-        )
-
-    return final
-
-
 def select_pose_arc_prior_indices(
     c2ws,
     num_prior_frames,
@@ -744,8 +625,8 @@ def select_pose_arc_prior_indices(
     Select prior/anchor frames by cumulative camera motion instead of uniform
     frame index.
 
-    This returns the requested number of anchors. The max-gap repair is applied
-    later in infer_prior_inds(), where extra anchors may be inserted if needed.
+    This returns the requested anchor count. The max-gap repair is applied after
+    selection and may insert extra anchors if needed.
     """
     c2ws_44 = _to_numpy_c2ws_44(c2ws)
     candidate_indices = _candidate_indices_from_inputs(
@@ -802,6 +683,124 @@ def select_pose_arc_prior_indices(
     return np.asarray(sorted(selected), dtype=np.int64)
 
 
+def _repair_raw_frame_gaps_allow_extra(
+    selected,
+    *,
+    num_frames,
+    input_frame_indices,
+    max_targets_between,
+    verbose=False,
+):
+    """
+    Final safety repair for interp chunking.
+
+    It enforces raw frame-index gaps:
+
+        adjacent_anchor_b - adjacent_anchor_a - 1 <= max_targets_between
+
+    for adjacent anchors a,b. This is deliberately stricter than counting only
+    non-input candidate frames, because chunk_input_and_test's interp assertion
+    is based on frame ordering/ranges.
+
+    For T=21, use max_targets_between=19.
+    """
+    if max_targets_between is None:
+        return np.asarray(selected, dtype=np.int64)
+
+    max_targets_between = int(max_targets_between)
+    if max_targets_between <= 0:
+        return np.asarray(selected, dtype=np.int64)
+
+    input_set = set(int(x) for x in input_frame_indices)
+    candidate_indices = np.asarray(
+        [i for i in range(int(num_frames)) if i not in input_set],
+        dtype=np.int64,
+    )
+
+    if candidate_indices.size == 0:
+        return candidate_indices
+
+    candidate_set = set(int(x) for x in candidate_indices.tolist())
+
+    selected_set = set()
+    for idx in np.asarray(selected).astype(np.int64).tolist():
+        idx = int(idx)
+        if idx in candidate_set:
+            selected_set.add(idx)
+
+    # Keep endpoints to bound the trajectory.
+    selected_set.add(int(candidate_indices[0]))
+    selected_set.add(int(candidate_indices[-1]))
+
+    def ordered_selected():
+        return sorted(selected_set)
+
+    def worst_gap():
+        ordered = ordered_selected()
+        if len(ordered) <= 1:
+            return 0, None, None
+
+        worst_count = -1
+        worst_a = None
+        worst_b = None
+
+        for a, b in zip(ordered[:-1], ordered[1:]):
+            count_between = max(0, int(b) - int(a) - 1)
+            if count_between > worst_count:
+                worst_count = int(count_between)
+                worst_a = int(a)
+                worst_b = int(b)
+
+        return worst_count, worst_a, worst_b
+
+    inserted = 0
+
+    while True:
+        count, a, b = worst_gap()
+
+        if count <= max_targets_between:
+            break
+
+        if a is None or b is None or b <= a + 1:
+            break
+
+        midpoint = 0.5 * (a + b)
+        between = [
+            int(x)
+            for x in candidate_indices
+            if int(a) < int(x) < int(b) and int(x) not in selected_set
+        ]
+
+        if not between:
+            break
+
+        new_anchor = min(between, key=lambda x: abs(x - midpoint))
+        selected_set.add(int(new_anchor))
+        inserted += 1
+
+    final = np.asarray(ordered_selected(), dtype=np.int64)
+    final_worst, _, _ = worst_gap()
+
+    if verbose:
+        print(
+            "[anchor_gap_repair_raw] "
+            f"inserted={inserted} "
+            f"final_num_anchors={len(final)} "
+            f"max_raw_targets_between={final_worst} "
+            f"limit={max_targets_between} "
+            f"indices={final.tolist()}"
+        )
+
+    if final_worst > max_targets_between:
+        print(
+            "[anchor_gap_repair_raw warning] "
+            f"Still exceeds raw target gap: {final_worst} > {max_targets_between}. "
+            "Try lowering --pose_anchor_max_gap or increasing --num_prior_frames_ratio."
+        )
+
+    return final
+
+
 def infer_prior_inds(
     c2ws,
     num_prior_frames,
@@ -821,7 +820,7 @@ def infer_prior_inds(
       pose_anchor_rot_ref_deg: float, default 10.0
       pose_anchor_max_gap: optional int
         If set, insert extra anchors until each adjacent anchor pair has at
-        most this many target frames between them. Use 19 when second-pass T=21.
+        most this many raw target frames between them. Use 19 when second-pass T=21.
       pose_anchor_verbose: bool
         Print anchor indices and gap-repair diagnostics.
     """
@@ -853,22 +852,16 @@ def infer_prior_inds(
                 "Use 'uniform_index' or 'pose_arc'."
             )
 
-        # Generic repair for SEVA interp second pass. This is deliberately
-        # applied after either uniform or pose_arc if pose_anchor_max_gap is set.
         max_targets_between = _option_optional_int(
             options.get("pose_anchor_max_gap", None),
             default=None,
         )
 
         if max_targets_between is not None:
-            c2ws_44 = _to_numpy_c2ws_44(c2ws)
-            candidate_indices = _candidate_indices_from_inputs(
-                c2ws_44.shape[0],
-                input_frame_indices,
-            )
-            prior_frame_indices = _enforce_max_target_gap_allow_extra(
+            prior_frame_indices = _repair_raw_frame_gaps_allow_extra(
                 prior_frame_indices,
-                candidate_indices,
+                num_frames=c2ws.shape[0],
+                input_frame_indices=input_frame_indices,
                 max_targets_between=max_targets_between,
                 verbose=_option_bool(
                     options.get("pose_anchor_verbose", False),
