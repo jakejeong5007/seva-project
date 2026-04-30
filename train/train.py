@@ -429,6 +429,57 @@ def parse_args() -> argparse.Namespace:
     )
 
     # ------------------------------------------------------------------
+    # SEVA/DDPM timestep sampling
+    # ------------------------------------------------------------------
+    parser.add_argument(
+        "--seva_noise_idx_min",
+        type=int,
+        default=0,
+        help="Inclusive minimum SEVA/DDPM noise index. Low index = low noise.",
+    )
+    parser.add_argument(
+        "--seva_noise_idx_max",
+        type=int,
+        default=999,
+        help=(
+            "Inclusive maximum SEVA/DDPM noise index. Use e.g. 100 or 200 "
+            "for low-noise fine-tuning / epipolar-loss ablations."
+        ),
+    )
+    parser.add_argument(
+        "--seva_timestep_sampling",
+        type=str,
+        default="uniform",
+        choices=["uniform", "low_noise_beta", "fixed"],
+        help=(
+            "How to sample SEVA/DDPM noise indices. 'uniform' preserves the "
+            "default behavior; 'low_noise_beta' biases toward lower-noise "
+            "indices inside the selected range; 'fixed' is deterministic."
+        ),
+    )
+    parser.add_argument(
+        "--seva_timestep_beta_alpha",
+        type=float,
+        default=0.7,
+        help="Beta alpha for --seva_timestep_sampling low_noise_beta.",
+    )
+    parser.add_argument(
+        "--seva_timestep_beta_beta",
+        type=float,
+        default=3.0,
+        help="Beta beta for --seva_timestep_sampling low_noise_beta.",
+    )
+    parser.add_argument(
+        "--seva_fixed_noise_idx",
+        type=int,
+        default=None,
+        help=(
+            "Fixed SEVA/DDPM noise index for deterministic debugging. "
+            "Only used when --seva_timestep_sampling fixed."
+        ),
+    )
+
+    # ------------------------------------------------------------------
     # Research: visibility-gated epipolar loss
     # ------------------------------------------------------------------
     parser.add_argument("--epi_loss_weight", type=float, default=0.0)
@@ -1324,6 +1375,12 @@ def main() -> None:
                     include_replace_in_conditioning=True,
                     use_activation_checkpointing=args.activation_checkpointing,
                     offload_frozen_encoders=args.offload_frozen_encoders,
+                    seva_noise_idx_min=args.seva_noise_idx_min,
+                    seva_noise_idx_max=args.seva_noise_idx_max,
+                    seva_timestep_sampling=args.seva_timestep_sampling,
+                    seva_timestep_beta_alpha=args.seva_timestep_beta_alpha,
+                    seva_timestep_beta_beta=args.seva_timestep_beta_beta,
+                    seva_fixed_noise_idx=args.seva_fixed_noise_idx,
                 )
 
             epi_out = None
@@ -1383,6 +1440,12 @@ def main() -> None:
                     "loss_diffusion": loss_out.loss.detach().float().item(),
                     "mse_mean": loss_out.mse_per_item.detach().float().mean().item(),
                     "weights_mean": loss_out.weights.detach().float().mean().item(),
+                    "noise_idx_min": float(loss_out.timesteps.detach().float().min().item()),
+                    "noise_idx_max": float(loss_out.timesteps.detach().float().max().item()),
+                    "noise_idx_mean": float(loss_out.timesteps.detach().float().mean().item()),
+                    "sigma_min": float(loss_out.sigma.detach().float().min().item()),
+                    "sigma_max": float(loss_out.sigma.detach().float().max().item()),
+                    "sigma_mean": float(loss_out.sigma.detach().float().mean().item()),
                     "lr": float(optimizer.param_groups[0]["lr"]),
                     "batch_size": batch_size,
                     "num_frames": frames,

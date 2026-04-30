@@ -8,11 +8,10 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, Literal, Optional
 
+import gc
 import torch
 import torch.nn.functional as F
 from torch import nn
-
-import gc
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 try:
@@ -251,13 +250,39 @@ def sample_seva_noise_levels(
     device: torch.device | str,
     num_idx: int = 1000,
     same_noise_level_per_clip: bool = True,
+    noise_idx_min: int = 0,
+    noise_idx_max: Optional[int] = None,
+    timestep_sampling: str = "uniform",
+    beta_alpha: float = 0.7,
+    beta_beta: float = 3.0,
+    fixed_noise_idx: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, DiscreteDenoiser]:
     """Sample SEVA/DDPM discrete noise indices and matching sigmas.
 
-    The released SEVA sampler uses ``DiscreteDenoiser`` / ``DDPMDiscretization``
-    with ``log_snr_shift=2.4`` and passes a discrete noise index into the U-Net.
-    For multiview training, the closest match to inference is to use one noise
-    level for the whole clip and broadcast it over T frames.
+    Low SEVA/DDPM index means low noise; high index means high noise. This
+    helper supports low-noise experiments for geometry losses while keeping the
+    default behavior identical to uniform SEVA/DDPM training over indices
+    ``0..999``.
+
+    Args:
+        batch_shape: ``(B, T)``.
+        device: Target device.
+        num_idx: Number of discrete SEVA/DDPM indices, normally 1000.
+        same_noise_level_per_clip: If True, sample one index per clip and
+            broadcast over all frames. This matches the multiview inference
+            convention better than sampling a different noise level per frame.
+        noise_idx_min: Inclusive lower bound for sampled indices.
+        noise_idx_max: Inclusive upper bound for sampled indices. ``None`` means
+            ``num_idx - 1``.
+        timestep_sampling:
+            ``"uniform"``: Uniform in ``[noise_idx_min, noise_idx_max]``.
+            ``"low_noise_beta"``: Beta distribution biased toward low indices
+            within the range. Good for experiments that emphasize final-image
+            / low-noise training without completely removing medium noise.
+            ``"fixed"``: Use ``fixed_noise_idx`` for deterministic debugging.
+        beta_alpha, beta_beta: Beta distribution parameters for
+            ``low_noise_beta``. Values alpha < beta bias toward low noise.
+        fixed_noise_idx: Required when ``timestep_sampling="fixed"``.
 
     Returns:
         noise_idx: [B, T] LongTensor of discrete timestep/noise indices.
@@ -267,11 +292,49 @@ def sample_seva_noise_levels(
     B, T = batch_shape
     denoiser = DiscreteDenoiser(num_idx=num_idx, device=device)
 
-    if same_noise_level_per_clip:
-        noise_idx = torch.randint(0, num_idx, (B,), device=device)
-        noise_idx = noise_idx[:, None].expand(B, T)
+    lo = int(noise_idx_min)
+    hi = int(num_idx - 1 if noise_idx_max is None else noise_idx_max)
+    if lo < 0 or hi >= num_idx or lo > hi:
+        raise ValueError(
+            f"Invalid SEVA noise index range [{lo}, {hi}] for num_idx={num_idx}."
+        )
+
+    sample_shape = (B,) if same_noise_level_per_clip else (B, T)
+
+    if timestep_sampling == "fixed":
+        if fixed_noise_idx is None:
+            raise ValueError("timestep_sampling='fixed' requires fixed_noise_idx.")
+        idx = int(fixed_noise_idx)
+        if idx < lo or idx > hi:
+            raise ValueError(f"fixed_noise_idx={idx} must be inside [{lo}, {hi}].")
+        noise_idx = torch.full(sample_shape, idx, device=device, dtype=torch.long)
+
+    elif timestep_sampling == "uniform":
+        noise_idx = torch.randint(
+            lo,
+            hi + 1,
+            sample_shape,
+            device=device,
+            dtype=torch.long,
+        )
+
+    elif timestep_sampling == "low_noise_beta":
+        if float(beta_alpha) <= 0.0 or float(beta_beta) <= 0.0:
+            raise ValueError("Beta parameters must be positive.")
+        alpha = torch.tensor(float(beta_alpha), device=device)
+        beta = torch.tensor(float(beta_beta), device=device)
+        u = torch.distributions.Beta(alpha, beta).sample(sample_shape)
+        noise_idx = lo + torch.floor(u * float(hi - lo + 1)).long()
+        noise_idx = noise_idx.clamp(min=lo, max=hi)
+
     else:
-        noise_idx = torch.randint(0, num_idx, (B, T), device=device)
+        raise ValueError(
+            f"Unsupported timestep_sampling={timestep_sampling!r}. "
+            "Use 'uniform', 'low_noise_beta', or 'fixed'."
+        )
+
+    if same_noise_level_per_clip:
+        noise_idx = noise_idx[:, None].expand(B, T)
 
     sigma = denoiser.idx_to_sigma(noise_idx)
     return noise_idx, sigma, denoiser
@@ -480,7 +543,13 @@ def compute_seva_diffusion_loss(
     include_replace_in_conditioning: bool = True,
     use_activation_checkpointing: bool = False,
     offload_frozen_encoders: bool = False,
-    ) -> DiffusionLossOutput:
+    seva_noise_idx_min: int = 0,
+    seva_noise_idx_max: int = 999,
+    seva_timestep_sampling: str = "uniform",
+    seva_timestep_beta_alpha: float = 0.7,
+    seva_timestep_beta_beta: float = 3.0,
+    seva_fixed_noise_idx: Optional[int] = None,
+) -> DiffusionLossOutput:
     """Compute one starter diffusion loss for SEVA.
 
     This is intentionally a *training starter* rather than a claim of being the
@@ -512,14 +581,14 @@ def compute_seva_diffusion_loss(
         )
 
     batch = _ensure_batched_clip_batch(batch)
-    
-    
     device_obj = _resolve_device(bundle, device)
 
     if offload_frozen_encoders:
-        if bundle.conditioner is not None:
+        # If the previous iteration moved the frozen CLIP conditioner / VAE to
+        # CPU, move them back before conditioning and latent encoding.
+        if bundle.conditioner is not None and not bundle.train_conditioner:
             bundle.conditioner.to(device_obj)
-        if bundle.ae is not None:
+        if bundle.ae is not None and not bundle.train_ae:
             bundle.ae.to(device_obj)
 
     imgs = _require_tensor(batch, "imgs").to(device_obj)
@@ -582,6 +651,12 @@ def compute_seva_diffusion_loss(
             device=device_obj,
             num_idx=1000,
             same_noise_level_per_clip=True,
+            noise_idx_min=seva_noise_idx_min,
+            noise_idx_max=seva_noise_idx_max,
+            timestep_sampling=seva_timestep_sampling,
+            beta_alpha=seva_timestep_beta_alpha,
+            beta_beta=seva_timestep_beta_beta,
+            fixed_noise_idx=seva_fixed_noise_idx,
         )
         sigma_e = _expand_bt(sigma, latents)
 
@@ -609,16 +684,15 @@ def compute_seva_diffusion_loss(
         t_flat = timesteps.flatten(0, 1).to(device=device_obj)
 
         if offload_frozen_encoders:
-            # After conditioning and latent encoding, the frozen CLIP conditioner
-            # and VAE are no longer needed during the SEVA backbone forward.
-            # Moving them off GPU can free several GB on a 40–48GB card.
+            # Conditioning and latent encoding are done. Move frozen modules off
+            # GPU before the heavy trainable SEVA backbone forward. This frees
+            # memory but adds CPU/GPU transfer overhead each iteration.
             if bundle.conditioner is not None and not bundle.train_conditioner:
                 bundle.conditioner.to("cpu")
             if bundle.ae is not None and not bundle.train_ae:
                 bundle.ae.to("cpu")
-
             gc.collect()
-            if torch.device(device_obj).type == "cuda":
+            if device_obj.type == "cuda":
                 torch.cuda.empty_cache()
 
         forward_context = _get_autocast_context(device_obj, autocast_dtype)
@@ -643,6 +717,13 @@ def compute_seva_diffusion_loss(
 
         with forward_context:
             if use_activation_checkpointing:
+                required = {"concat", "crossattn", "dense_vector"}
+                missing = required.difference(moved_c.keys())
+                if missing:
+                    raise KeyError(
+                        "Activation checkpointing path requires conditioning keys "
+                        f"{sorted(required)}, missing {sorted(missing)}."
+                    )
                 pred = activation_checkpoint(
                     _run_wrapper_checkpointed,
                     x * c_in,
@@ -654,12 +735,7 @@ def compute_seva_diffusion_loss(
                     preserve_rng_state=True,
                 )
             else:
-                pred = bundle.wrapper(
-                    x * c_in,
-                    t_flat,
-                    c=moved_c,
-                    num_frames=T,
-                )
+                pred = bundle.wrapper(x * c_in, t_flat, c=moved_c, num_frames=T)
 
     else:
         timesteps = sample_timesteps(
@@ -745,6 +821,14 @@ class SevaDiffusionLoss(nn.Module):
         encoder_no_grad: Optional[bool] = None,
         autocast_dtype: Optional[torch.dtype] = None,
         include_replace_in_conditioning: bool = True,
+        use_activation_checkpointing: bool = False,
+        offload_frozen_encoders: bool = False,
+        seva_noise_idx_min: int = 0,
+        seva_noise_idx_max: int = 999,
+        seva_timestep_sampling: str = "uniform",
+        seva_timestep_beta_alpha: float = 0.7,
+        seva_timestep_beta_beta: float = 3.0,
+        seva_fixed_noise_idx: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.latent_downsample_factor = int(latent_downsample_factor)
@@ -766,6 +850,14 @@ class SevaDiffusionLoss(nn.Module):
         self.encoder_no_grad = encoder_no_grad
         self.autocast_dtype = autocast_dtype
         self.include_replace_in_conditioning = bool(include_replace_in_conditioning)
+        self.use_activation_checkpointing = bool(use_activation_checkpointing)
+        self.offload_frozen_encoders = bool(offload_frozen_encoders)
+        self.seva_noise_idx_min = int(seva_noise_idx_min)
+        self.seva_noise_idx_max = int(seva_noise_idx_max)
+        self.seva_timestep_sampling = str(seva_timestep_sampling)
+        self.seva_timestep_beta_alpha = float(seva_timestep_beta_alpha)
+        self.seva_timestep_beta_beta = float(seva_timestep_beta_beta)
+        self.seva_fixed_noise_idx = seva_fixed_noise_idx
 
     def forward(
         self,
@@ -799,6 +891,14 @@ class SevaDiffusionLoss(nn.Module):
             encoder_no_grad=self.encoder_no_grad,
             autocast_dtype=self.autocast_dtype,
             include_replace_in_conditioning=self.include_replace_in_conditioning,
+            use_activation_checkpointing=self.use_activation_checkpointing,
+            offload_frozen_encoders=self.offload_frozen_encoders,
+            seva_noise_idx_min=self.seva_noise_idx_min,
+            seva_noise_idx_max=self.seva_noise_idx_max,
+            seva_timestep_sampling=self.seva_timestep_sampling,
+            seva_timestep_beta_alpha=self.seva_timestep_beta_alpha,
+            seva_timestep_beta_beta=self.seva_timestep_beta_beta,
+            seva_fixed_noise_idx=self.seva_fixed_noise_idx,
         )
 
 
