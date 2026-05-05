@@ -1,3 +1,22 @@
+# Project Addendum: Geometric Adaptation of SEVA
+
+This fork was used for an individual project on **compute-efficient geometric adaptation of Stable Virtual Camera (SEVA)** for trajectory novel view synthesis.
+
+The project explored two main directions:
+
+- **Low-noise epipolar fine-tuning:** implementing a visibility-gated epipolar distribution loss that uses known source and target camera geometry to encourage view-to-view consistency.
+- **Pose-adaptive inference sampling:** modifying SEVA's trajectory anchor selection so anchors are chosen based on cumulative camera motion instead of only uniform frame index.
+
+The project paper is uploaded in this repository as:
+
+```text
+Compute_Efficient_Geometric_Adaptation_of_Stable_Virtual_Camera_for_Trajectory_Novel_View_Synthesis_v1.pdf
+```
+
+The paper summarizes the motivation, implementation, ablation experiments, and preliminary findings. In short, the experiments suggest that epipolar supervision is more useful when applied near low-noise timesteps, while pose-adaptive sampling is a practical low-compute way to improve perceptual trajectory quality without changing model weights.
+
+---
+
 <div align="center">
 <h1>Stable Virtual Camera: Generative View Synthesis with Diffusion Models</h1>
 
