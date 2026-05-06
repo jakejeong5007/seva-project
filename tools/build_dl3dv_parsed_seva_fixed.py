@@ -1,58 +1,9 @@
 #!/usr/bin/env python3
 """
-build_dl3dv_parsed_seva_fixed.py
+Convert DL3DV scene zip files into SEVA/Reconfusion-style scene folders.
 
-Parse DL3DV hashed scene zip files into SEVA/Reconfusion-style scene folders.
-
-This version fixes the two issues that caused poor official-SEVA rendering on
-your converted scenes:
-
-1. Intrinsics are scaled to the ACTUAL extracted image size.
-   Example: raw metadata 3840x2160, stored image 480x270:
-       fl_x, cx are multiplied by 480 / 3840
-       fl_y, cy are multiplied by 270 / 2160
-
-2. Per-scene train_test_split_*.json files are author-style:
-   - input views are selected by camera-space K-means
-   - target views are strided, e.g. 0, 8, 16, ...
-   - old behavior "evenly spaced inputs + every remaining target" is avoided
-
-Output structure:
-
-<output_dir>/
-├── dataset_meta.json
-├── zip_index.json
-├── parser_warnings.log
-├── splits/
-│   ├── train.jsonl
-│   ├── val.jsonl
-│   └── test.jsonl
-└── scenes/
-    ├── 000000/
-    │   ├── scene_meta.json
-    │   ├── transforms.json
-    │   ├── cameras.npz
-    │   ├── train_test_split_1.json
-    │   ├── train_test_split_3.json
-    │   ├── train_test_split_6.json
-    │   ├── train_test_split_16.json
-    │   ├── train_test_split_32.json
-    │   └── images/
-    │       ├── 000000.jpg
-    │       ├── 000001.jpg
-    │       └── ...
-
-Requirements:
-    pip install pillow numpy
-
-Example:
-    python tools/build_dl3dv_parsed_seva_fixed.py \
-      --input_dir /path/to/raw/DL3DV/11K \
-      --output_dir /path/to/dataset/dl3dv_parsed_fixed/11K \
-      --scene_num_inputs 1 3 6 16 32 \
-      --target_stride 8 \
-      --image_format jpg \
-      --overwrite
+The parser extracts images, scales intrinsics to the stored image size, writes
+per-frame camera metadata, and creates camera-aware train/test split files.
 """
 
 from __future__ import annotations
@@ -75,9 +26,7 @@ from PIL import Image
 
 DEFAULT_SCENE_NUM_INPUTS = [1, 3, 6, 16, 32]
 
-# These top-level fields are dangerous after image extraction/downsampling because
-# SEVA's ReconfusionParser may prefer top-level camera metadata over frame-level
-# metadata. We remove them and write correct per-frame values instead.
+# Top-level camera fields are removed so per-frame metadata is used consistently.
 DROP_TOP_LEVEL_CAMERA_KEYS = {
     "w",
     "h",
@@ -94,8 +43,7 @@ DROP_TOP_LEVEL_CAMERA_KEYS = {
     "camera_model",
 }
 
-# Reconfusion/SEVA uses pinhole K in this path. Keep the RGBs as they are, but do
-# not keep stale distortion parameters in the normalized transforms.
+# Distortion parameters are dropped in the normalized pinhole export.
 DROP_FRAME_DISTORTION_KEYS = {"k1", "k2", "k3", "k4", "p1", "p2"}
 
 
@@ -494,7 +442,7 @@ def build_scene_train_test_splits(
         )
         train_set = set(train_ids)
 
-        # Author-style: strided target trajectory, not every remaining frame.
+        # Use strided target frames instead of every remaining frame.
         test_ids = [idx for idx in range(0, num_frames, target_stride) if idx not in train_set]
 
         # Fallback for very short scenes or unlucky overlaps.

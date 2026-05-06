@@ -115,7 +115,7 @@ class DummyAE(nn.Module):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Canonical SEVA training entrypoint for the local training stack."
+        description="SEVA training entrypoint."
     )
     parser.add_argument("--dataset_root", type=Path, required=True)
     parser.add_argument("--output_dir", type=Path, default=Path("runs"))
@@ -428,9 +428,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    # ------------------------------------------------------------------
-    # SEVA/DDPM timestep sampling
-    # ------------------------------------------------------------------
+        # SEVA/DDPM timestep sampling
     parser.add_argument(
         "--seva_noise_idx_min",
         type=int,
@@ -479,9 +477,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    # ------------------------------------------------------------------
-    # Research: visibility-gated epipolar loss
-    # ------------------------------------------------------------------
+    # Epipolar auxiliary loss
     parser.add_argument("--epi_loss_weight", type=float, default=0.0)
     parser.add_argument("--epi_start_step", type=int, default=1000)
     parser.add_argument("--epi_warmup_steps", type=int, default=2000)

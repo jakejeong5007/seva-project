@@ -1,63 +1,10 @@
-
 """
-train/training/epipolar_loss.py
+Visibility-gated epipolar distribution loss for SEVA fine-tuning.
 
-Visibility-Gated Epipolar Distribution Loss (VG-EDL) for SEVA.
-
-Design goals
-------------
-1. Keep the SEVA architecture unchanged.
-2. Use only data you already have in training:
-     - imgs
-     - Ks
-     - c2ws
-     - input_mask
-     - diffusion loss output (pred, noisy_latents, sigma)
-3. Avoid requiring depth or a learned matcher.
-4. Be robust to occlusion / ambiguous texture:
-     - teacher is a *distribution* along the source epipolar line
-     - low-confidence or no-overlap pixels are skipped
-5. Support arbitrary 3D camera rotation because the geometry is built from the
-   full relative rotation matrices, not Euler angles.
-
-High-level idea
----------------
-For a target frame t and an input/source frame s:
-
-  1. Reconstruct the predicted clean latent x0_hat from the current diffusion
-     prediction and decode it to a target RGB image.
-  2. For a set of target pixels p_t, compute the epipolar line l_s in the
-     source image induced by the known cameras.
-  3. Sample K points along that line.
-  4. Compare:
-       - GT target feature at p_t  -> teacher distribution over the K source points
-       - Pred target feature at p_t -> student distribution over the K source points
-  5. Minimize KL(teacher || student), but only where the teacher is confident.
-
-Why this is useful
-------------------
-This does *not* force direct RGB reconstruction. Instead it says:
-
-    "When a target pixel has a confident, visible match somewhere along the
-     correct source epipolar line, the generated target should prefer the same
-     source-line locations that the real target prefers."
-
-That makes it more geometry-specific than RGB or LPIPS and more robust than a
-hard point correspondence.
-
-Practical note
---------------
-This file is written to match the current training code discussed in this
-project:
-  - compute_seva_diffusion_loss(...) returns pred, noisy_latents, sigma
-  - batch contains imgs, Ks, c2ws, input_mask
-  - the SEVA autoencoder exposes decode(z, chunk_size=None)
-
-The loss is intentionally conservative and light:
-  - one target frame per clip by default
-  - one source frame per target by default
-  - low-resolution descriptors (128x128 by default)
-  - cheap RGB+Sobel features
+The loss compares source-line correspondence distributions from a ground-truth
+target image and a predicted target image. Camera poses define the source
+epipolar line; confidence and sigma gates control where the auxiliary loss is
+applied.
 """
 
 from __future__ import annotations
@@ -82,61 +29,7 @@ PredictionType = Literal["epsilon", "x0"]
 
 @dataclass
 class EpipolarLossConfig:
-    """
-    Configuration for the visibility-gated epipolar loss.
-
-    The defaults are chosen to be safe for a first experiment rather than
-    maximally strong.
-
-    loss_weight:
-        Final scalar multiplier applied to the geometric loss.
-    start_step / warmup_steps / every:
-        Training schedule controls. Start the loss after diffusion has settled a
-        bit, then ramp in gradually.
-    prediction_type:
-        How to reconstruct x0_hat from the diffusion model output.
-        For the current SEVA/DDPM training path this should be "epsilon".
-    target_frames_per_clip:
-        How many target frames to supervise per batch item. Start with 1 to keep
-        memory small.
-    sources_per_target:
-        How many input views to pair with each target frame. Start with 1.
-    feature_res:
-        Descriptor resolution. Smaller is cheaper; 128 is a good first value.
-    pixels_per_pair:
-        Number of target pixels sampled for one source-target pair.
-    line_samples:
-        Number of sampled points along each epipolar line.
-    textured_fraction:
-        Fraction of sampled target pixels drawn from high-gradient regions. The
-        remaining fraction is sampled uniformly.
-    tau:
-        Softmax temperature used to form teacher/student line distributions.
-    confidence_min:
-        Minimum confidence below which a pixel is ignored entirely.
-    match_logit_center / match_logit_scale:
-        Convert teacher best-similarity into a soft confidence gate.
-    max_sigma / sigma_softness:
-        Sigma-based gate. The geometry loss is down-weighted on very noisy steps.
-    min_epipolar_baseline:
-        Below this translation baseline, epipolar geometry becomes degenerate.
-        If use_rotation_h_fallback=True, we switch to a rotation-homography loss.
-    use_rotation_h_fallback:
-        If True, use a simple rotation-only homography feature loss when the
-        translation baseline is tiny.
-    min_rotation_for_h_deg:
-        Minimum relative rotation required before using the homography fallback.
-    min_valid_ratio:
-        Minimum fraction of sampled pixels that must produce a valid epipolar
-        segment (or valid homography projection) or the pair is skipped.
-    feature_mode:
-        Descriptor type. "rgb_sobel" is intentionally cheap and stable.
-    ae_decode_chunk_size:
-        Chunk size passed to AE.decode(). Keep this small.
-    auto_move_ae_to_device:
-        If the training loss previously offloaded the frozen AE to CPU, move it
-        back to the target device before decoding.
-    """
+    """Configuration for the epipolar auxiliary loss."""
 
     loss_weight: float = 1e-3
     start_step: int = 1000
@@ -173,40 +66,7 @@ class EpipolarLossConfig:
 
 @dataclass
 class EpipolarLossOutput:
-    """
-    Output container for logging/debugging.
-
-    loss:
-        Final weighted loss that should be added to the diffusion loss.
-    raw_loss:
-        Unweighted mean pair loss before loss_weight, warmup, and sigma gating.
-    warmup_factor:
-        Step-based warmup multiplier in [0, 1].
-    mean_sigma_gate:
-        Mean sigma gate applied to used target frames.
-    mean_confidence:
-        Mean confidence across used pixels.
-    mean_valid_ratio:
-        Mean fraction of sampled pixels that produced valid geometry.
-    mean_baseline:
-        Mean source-target translation baseline.
-    mean_rotation_deg:
-        Mean full relative rotation angle in degrees.
-    num_pairs:
-        Number of source-target pairs that contributed.
-    num_target_frames:
-        Number of target frames that contributed.
-    num_pixels:
-        Number of pixels used after confidence filtering.
-    num_epipolar_pairs:
-        Number of pairs using the epipolar branch.
-    num_homography_pairs:
-        Number of pairs using the rotation-homography fallback.
-    num_skipped_pairs:
-        Pairs skipped due to low overlap / invalid geometry / no confident pixels.
-    pair_modes:
-        String list for debug. Usually not logged every step, but helpful.
-    """
+    """Values returned for training logs and diagnostics."""
 
     loss: torch.Tensor
     raw_loss: torch.Tensor
@@ -228,24 +88,7 @@ class EpipolarLossOutput:
 
 @dataclass
 class PairLossStats:
-    """
-    Internal per-pair statistics.
-
-    loss:
-        Mean pair loss before outer weighting.
-    mean_confidence:
-        Mean confidence over valid pixels.
-    valid_ratio:
-        Fraction of sampled pixels that produced valid geometry.
-    num_pixels_used:
-        Number of pixels with confidence > 0.
-    mode:
-        "epipolar" or "rotation_homography".
-    baseline:
-        Translation baseline between source and target cameras.
-    rotation_deg:
-        Full relative rotation angle between source and target cameras.
-    """
+    """Internal statistics for one source-target pair."""
 
     loss: torch.Tensor
     mean_confidence: torch.Tensor
@@ -417,22 +260,7 @@ def _sobel(gray: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 def build_rgb_sobel_descriptor(img01: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """
-    Cheap local descriptor used for the first epipolar experiments.
-
-    Descriptor channels:
-        3 x RGB
-        1 x Sobel-x on grayscale
-        1 x Sobel-y on grayscale
-
-    Then L2-normalize across channels.
-
-    Why this descriptor?
-        - very cheap
-        - fully differentiable
-        - enough to test the geometry idea
-        - avoids bringing in DINO / VGG memory at the first stage
-    """
+    """Build a fixed RGB+Sobel descriptor and normalize it by channel."""
     gray = _rgb01_to_gray(img01)
     gx, gy = _sobel(gray)
     feat = torch.cat([img01, gx, gy], dim=1)
@@ -581,14 +409,7 @@ def _warmup_factor(global_step: Optional[int], config: EpipolarLossConfig) -> fl
 
 
 def should_apply_epipolar_loss(global_step: Optional[int], config: EpipolarLossConfig) -> bool:
-    """
-    Convenience gate for train.py.
-
-    Example:
-        if should_apply_epipolar_loss(global_step, epi_cfg):
-            epi_out = compute_visibility_gated_epipolar_loss(...)
-            loss = loss + epi_out.loss
-    """
+    """Return True when the epipolar loss should be evaluated."""
     if config.loss_weight <= 0.0:
         return False
     if global_step is None:
@@ -686,12 +507,7 @@ def _sample_textured_pixels(
     num_pixels: int,
     textured_fraction: float,
 ) -> torch.Tensor:
-    """
-    Sample target pixels with a bias toward textured regions.
-
-    Why:
-        Epipolar matching on completely flat pixels is ambiguous and noisy.
-    """
+    """Sample target pixels with a bias toward high-gradient regions."""
     _, _, H, W = gt_img01.shape
     gray = _rgb01_to_gray(gt_img01)
     gx, gy = _sobel(gray)

@@ -1,6 +1,4 @@
-# File: diffusion_loss.py
-# Description: Starter diffusion training loss for SEVA built to match the
-#              current clip_dataset.py, conditioning.py, and model_factory.py.
+"""SEVA diffusion training loss and timestep sampling utilities."""
 
 from __future__ import annotations
 
@@ -18,11 +16,7 @@ try:
     from seva.sampling import DiscreteDenoiser
 except Exception:  # pragma: no cover - avoids pulling optional demo deps such as gradio.
     class DiscreteDenoiser:  # type: ignore[no-redef]
-        """Minimal fallback matching SEVA's DDPM sigma table for training loss.
-
-        The official class lives in seva.sampling, but that module imports demo
-        dependencies in some checkouts. Training only needs idx_to_sigma().
-        """
+        """Small fallback for mapping SEVA/DDPM indices to sigma values."""
 
         def __init__(
             self,
@@ -76,38 +70,7 @@ ObjectiveName = Literal["epsilon", "x0", "v", "velocity"]
 
 @dataclass
 class DiffusionLossOutput:
-    """Container for one SEVA training-loss forward pass.
-
-    Attributes:
-        loss:
-            Scalar training loss after masking/weighting.
-        mse_per_item:
-            Per-frame MSE reduced over latent channels and spatial dims.
-            Shape [B, T].
-        weights:
-            Per-frame loss weights used for the final weighted average.
-            Shape [B, T].
-        pred:
-            Model prediction in flattened form [B*T, C, h, w].
-        target:
-            Training target in flattened form [B*T, C, h, w].
-        latents:
-            Clean latents [B, T, C, h, w].
-        noisy_latents:
-            Noisy latents [B, T, C, h, w].
-        noise:
-            Sampled Gaussian noise [B, T, C, h, w].
-        timesteps:
-            Continuous timesteps [B, T] for debug schedules, or discrete SEVA/DDPM noise indices [B, T] for schedule="seva_ddpm".
-        alpha:
-            Clean-signal coefficient [B, T].
-        sigma:
-            Noise coefficient [B, T].
-        conditioning:
-            ConditioningOutput from conditioning.py.
-        flat_conditioning:
-            Flattened model conditioning dict [B*T, ...].
-    """
+    """Container returned by one diffusion-loss forward pass."""
 
     loss: torch.Tensor
     mse_per_item: torch.Tensor
@@ -257,38 +220,7 @@ def sample_seva_noise_levels(
     beta_beta: float = 3.0,
     fixed_noise_idx: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, DiscreteDenoiser]:
-    """Sample SEVA/DDPM discrete noise indices and matching sigmas.
-
-    Low SEVA/DDPM index means low noise; high index means high noise. This
-    helper supports low-noise experiments for geometry losses while keeping the
-    default behavior identical to uniform SEVA/DDPM training over indices
-    ``0..999``.
-
-    Args:
-        batch_shape: ``(B, T)``.
-        device: Target device.
-        num_idx: Number of discrete SEVA/DDPM indices, normally 1000.
-        same_noise_level_per_clip: If True, sample one index per clip and
-            broadcast over all frames. This matches the multiview inference
-            convention better than sampling a different noise level per frame.
-        noise_idx_min: Inclusive lower bound for sampled indices.
-        noise_idx_max: Inclusive upper bound for sampled indices. ``None`` means
-            ``num_idx - 1``.
-        timestep_sampling:
-            ``"uniform"``: Uniform in ``[noise_idx_min, noise_idx_max]``.
-            ``"low_noise_beta"``: Beta distribution biased toward low indices
-            within the range. Good for experiments that emphasize final-image
-            / low-noise training without completely removing medium noise.
-            ``"fixed"``: Use ``fixed_noise_idx`` for deterministic debugging.
-        beta_alpha, beta_beta: Beta distribution parameters for
-            ``low_noise_beta``. Values alpha < beta bias toward low noise.
-        fixed_noise_idx: Required when ``timestep_sampling="fixed"``.
-
-    Returns:
-        noise_idx: [B, T] LongTensor of discrete timestep/noise indices.
-        sigma:     [B, T] FloatTensor of sigmas corresponding to noise_idx.
-        denoiser:  The ``DiscreteDenoiser`` instance used for the mapping.
-    """
+    """Sample discrete SEVA/DDPM noise indices and the matching sigma values."""
     B, T = batch_shape
     denoiser = DiscreteDenoiser(num_idx=num_idx, device=device)
 
@@ -550,26 +482,7 @@ def compute_seva_diffusion_loss(
     seva_timestep_beta_beta: float = 3.0,
     seva_fixed_noise_idx: Optional[int] = None,
 ) -> DiffusionLossOutput:
-    """Compute one starter diffusion loss for SEVA.
-
-    This is intentionally a *training starter* rather than a claim of being the
-    exact unpublished internal SEVA loss. It is designed to fit the current
-    files you already validated:
-      - clip_dataset.py
-      - conditioning.py
-      - model_factory.py
-
-    Expected workflow for schedule="seva_ddpm":
-      1. Encode full clips to latents with bundle.ae.
-      2. Build conditioning with CLIP, Plücker coordinates, and clean input-view replacement.
-      3. Sample SEVA/DDPM discrete noise indices and sigmas.
-      4. Add noise as x_sigma = x0 + sigma * epsilon.
-      5. Replace input-view latent slots with clean encoded input latents.
-      6. Apply the released denoiser input scaling c_in.
-      7. Train the raw SGMWrapper to predict epsilon on target frames only.
-
-    The older cosine_vp / rf_linear paths are kept only as generic debug fallbacks.
-    """
+    """Compute one SEVA diffusion training loss."""
     if bundle.conditioner is None:
         raise ValueError(
             "compute_seva_diffusion_loss requires bundle.conditioner. "
